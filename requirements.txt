@@ -45,4 +45,4 @@ moviepy
 wandb
 
 # OSWorld and CUA-Gym are installed separately from their upstream sources.
-# Internal packages such as bytedlogger and bytedtos are intentionally omitted.
+# Internal packages are intentionally omitted.
