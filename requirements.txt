@@ -1,0 +1,48 @@
+# Core model and distributed training
+torch==2.8.0
+torchvision==0.23.0
+transformers==4.57.0
+tokenizers==0.22.2
+accelerate==1.10.0
+deepspeed==0.19.7
+peft==0.17.1
+safetensors==0.8.0
+liger_kernel==0.5.10
+triton==3.4.0
+
+# Video, image, and audio processing
+numpy==1.26.4
+pillow==11.3.0
+decord==0.6.0
+torchcodec==0.6.0
+soundfile==0.12.1
+soxr==0.5.0.post1
+kokoro==0.9.4
+tomli; python_version < "3.11"
+
+# Model APIs
+openai==2.14.0
+google-genai==1.56.0
+google-api-core==2.25.1
+
+# Utilities imported directly by the repository
+backoff==2.2.1
+einops==0.8.0
+huggingface_hub==0.36.2
+joblib==1.4.2
+line_profiler==5.0.2
+packaging==24.2
+prettytable
+regex==2026.9.10
+requests==2.32.3
+tqdm==4.66.5
+
+# These modules are imported by optional model-conversion, evaluation, or
+# visualization utilities, but their public versions were not present in the
+# exported development environment.
+bitsandbytes
+moviepy
+wandb
+
+# OSWorld and CUA-Gym are installed separately from their upstream sources.
+# Internal packages such as bytedlogger and bytedtos are intentionally omitted.

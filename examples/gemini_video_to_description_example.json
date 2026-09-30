@@ -1,0 +1,5 @@
+{
+  "/path/to/tutorial.mp4": {
+    "description": "A textual description extracted from the tutorial video."
+  }
+}
