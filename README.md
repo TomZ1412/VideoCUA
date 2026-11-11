@@ -135,7 +135,7 @@ See [`vsvex_train/README.md`](vex_code/vsvex_train/README.md) for stage-specific
 ## 🧪 Evaluation and verification
 
 1. Extract tutorial guidance with the existing training `test.sh`, selecting `adapter_2`.
-2. Convert decoding outputs with [`get_video_desc.py`](vex_code/vsvex_inference/guidance/get_video_desc.py).
+2. Prepare a task-to-guidance JSON mapping from the decoding outputs.
 3. Run OSWorld/CUA-Gym with the [`benchmark launchers`](vex_code/scripts/), selecting `adapter_1` for action prediction.
 4. Collect trajectories and render narrated videos using [`verification/`](vex_code/vsvex_inference/verification/).
 5. Score with [`run_verifier.sh`](vex_code/vsvex_verifier/run_verifier.sh), then select trials using [`scorer/`](vex_code/scorer/).

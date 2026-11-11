@@ -11,9 +11,7 @@ The existing Qwen3.5 trainer selects dual-LoRA AGGO with train_type=cua_grpo.
 
 The existing vsvex_train/qwen35_cua_multirl_dualora/test.sh decodes guidance with
 CHECKPOINT/adapter_2. Use its scripts/README_test.md and the input schema in
-../example/guidance_osworld.json. Convert combined
-predictions with vsvex_inference/guidance/get_video_desc.py after configuring its
-mapping and input/output paths. For silent-video guidance set use_audio=false.
+../example/guidance_osworld.json. Prepare a task-to-guidance JSON mapping from the combined predictions. For silent-video guidance set use_audio=false.
 
 ## Benchmarks
 
