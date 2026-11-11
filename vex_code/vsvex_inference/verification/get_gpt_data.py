@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 def normalize_task_name(name: str) -> str:
     name = name.replace("_verified", "")
-    name = re.sub(r"_sample_\d+$", "", name)
+    name = re.sub(r"_sample_?\d+$", "", name)
     name = re.sub(r"_video_\d+$", "", name)
     return name
 
@@ -58,10 +58,20 @@ def read_result_score(result_path: Path):
 
 
 def load_task_config(examples_root: Path, category: str, task_name: str):
+    """Prefer original category/task names, then try verified aliases."""
     task_base = normalize_task_name(task_name)
-    config_path = examples_root / category / f"{task_base}.json"
-    with config_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    original_base = re.sub(r"_sample_?\d+$", "", task_name)
+    original_base = re.sub(r"_video_\d+$", "", original_base)
+    category_base = category.removesuffix("_verified")
+    categories = dict.fromkeys((category, category_base, f"{category_base}_verified"))
+    task_ids = dict.fromkeys((original_base, task_base, f"{task_base}_verified"))
+    candidates = [examples_root / name / f"{task_id}.json"
+                  for name in categories for task_id in task_ids]
+    for config_path in candidates:
+        if config_path.is_file():
+            with config_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    raise FileNotFoundError("Task config not found; tried: " + ", ".join(map(str, candidates)))
 
 
 def load_steps(task_path: Path):
@@ -96,7 +106,7 @@ def build_piece(category, task_dir: Path, task_config, model: str, sample_id: in
 
     return {
         "category": category,
-        "task": task_dir.name if sample_id == 0 else f"{task_dir.name}_sample_{sample_id}",
+        "task": task_dir.name if sample_id < 0 else f"{task_dir.name}_sample{sample_id}",
         "instruction": task_config["instruction"],
         "init_screenshot": init_screenshot,
         "result": read_result_score(result_path),
@@ -113,22 +123,22 @@ def main():
     parser.add_argument(
         "--whitelist",
         type=Path,
-        default=Path("OSWorld-self-evolve/videosearch/testset_full_videos.json"),
+        default=Path('YOUR_TASK_MANIFEST_PATH'),
     )
     parser.add_argument(
         "--basepath",
         type=Path,
-        default=Path("OSWorld-self-evolve/results/vs2_agentnet_dualLoRA_both"),
+        default=Path('YOUR_BENCHMARK_RESULTS_PATH'),
     )
     parser.add_argument(
         "--examples-root",
         type=Path,
-        default=Path("OSWorld-self-evolve/OSWorld/evaluation_examples/examples"),
+        default=Path('YOUR_TASK_CONFIG_ROOT_PATH'),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("code/OSWorld-self-evolve/data/workspace/traj_data_vs2_5samples_dualboth_v2.json"),
+        default=Path('YOUR_TRAJECTORIES_OUTPUT_PATH'),
     )
     parser.add_argument("--model", default="vs2")
     parser.add_argument("--nsample", type=int, default=1)

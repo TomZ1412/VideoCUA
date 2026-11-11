@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import argparse
 from collections import defaultdict
@@ -7,7 +8,7 @@ from tqdm import tqdm
 
 def get_grouped_category_name(category):
     """Maps app-level categories to high-level task groups."""
-    normalized = category.lower()
+    normalized = category.lower().removesuffix("_verified")
     if "multi_apps" in normalized or "multi_app" in normalized or "workflow" in normalized:
         return "Workflow"
     if "libreoffice_calc" in normalized or "libreoffice_impress" in normalized or "libreoffice_writer" in normalized:
@@ -31,7 +32,7 @@ def build_grouped_stats(stats):
 
 def get_grouped_category_name(category):
     """Maps app-level categories to high-level task groups."""
-    normalized = category.lower()
+    normalized = category.lower().removesuffix("_verified")
     if normalized in {"libreoffice_calc", "libreoffice_impress", "libreoffice_writer"}:
         return "Office"
     if normalized in {"chrome", "vlc", "vlc_player", "thunderbird"}:
@@ -93,8 +94,8 @@ def discover_tasks_from_results(results_dir):
             if not os.path.isdir(entry_path):
                 continue
 
-            if "_sample_" in entry:
-                base_task_id = entry.rsplit("_sample_", 1)[0]
+            if "_sample" in entry:
+                base_task_id = entry.rsplit("_sample", 1)[0]
             elif "_audio_" in entry:
                 base_task_id = entry.rsplit("_audio_", 1)[0]
             else:
@@ -131,7 +132,6 @@ def is_done(traj_path):
     与第二个脚本一致：检查 traj.jsonl 最后一条 action 是否包含 terminate。
     同时兼容旧格式中的 DONE。
     """
-    return True
     try:
         with open(traj_path, "r") as f:
             lines = f.readlines()
@@ -157,28 +157,68 @@ def is_done(traj_path):
         return False
 
 
-def build_task_dir_candidates(task_id, sample_idx):
-    """
-    兼容两种目录命名：
-    - task_id / task_id_sample_N
-    - task_id_audio_N
+def verified_name_candidates(name):
+    """Prefer the requested name, then try its verified/unverified alias."""
+    base = name.removesuffix("_verified")
+    return list(dict.fromkeys((name, base, f"{base}_verified")))
 
-    这里把 sample_indices 视为 0-based rollout 序号：
-    - 0 -> task_id 或 task_id_audio_1
-    - 1 -> task_id_sample_1 或 task_id_audio_2
-    """
-    normalized_task_id = task_id.replace("_verified", "")
+
+def build_task_dir_candidates(task_id, sample_idx):
+    """Resolve plain/sample/audio/video rollouts with either task-ID suffix."""
     candidates = []
-    if sample_idx == 0:
-        candidates.append(normalized_task_id)
-    else:
-        candidates.append(f"{normalized_task_id}_sample_{sample_idx}")
-    candidates.append(f"{normalized_task_id}_audio_{sample_idx + 1}")
-    candidates.append(f"{normalized_task_id}_video_{sample_idx + 1}")
+    for candidate_id in verified_name_candidates(task_id):
+        candidates.append(f"{candidate_id}_sample{sample_idx}")
+        if sample_idx == 0:
+            candidates.append(candidate_id)
+        candidates.append(f"{candidate_id}_audio_{sample_idx + 1}")
+        candidates.append(f"{candidate_id}_video_{sample_idx + 1}")
     return list(dict.fromkeys(candidates))
 
 
-def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices):
+def discover_sample_indices(results_dir):
+    """从 results_dir 自动扫描所有已有 sample 下标。"""
+    sample_indices = set()
+
+    if not os.path.isdir(results_dir):
+        return [0]
+
+    for category in os.listdir(results_dir):
+        category_dir = os.path.join(results_dir, category)
+        if not os.path.isdir(category_dir):
+            continue
+
+        for entry in os.listdir(category_dir):
+            entry_path = os.path.join(category_dir, entry)
+            if not os.path.isdir(entry_path):
+                continue
+
+            matched = False
+            for pattern, offset in ((r"_sample(\d+)$", 0), (r"_audio_(\d+)$", -1), (r"_video_(\d+)$", -1)):
+                match = re.search(pattern, entry)
+                if match:
+                    sample_indices.add(max(0, int(match.group(1)) + offset))
+                    matched = True
+                    break
+
+            if not matched:
+                sample_indices.add(0)
+
+    return sorted(sample_indices) if sample_indices else [0]
+
+
+def resolve_sample_indices(sample_indices_arg, results_dir):
+    if len(sample_indices_arg) == 1 and sample_indices_arg[0].lower() == "auto":
+        sample_indices = discover_sample_indices(results_dir)
+        print(f"Auto-discovered sample indices: {sample_indices}")
+        return sample_indices
+
+    if any(item.lower() == "auto" for item in sample_indices_arg):
+        raise ValueError("--sample_indices 要么传 auto，要么传一组整数下标，不能混用。")
+
+    return sorted(set(int(item) for item in sample_indices_arg))
+
+
+def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices, sample_agg="mean"):
     """
     与第二个脚本保持一致的统计逻辑：
 
@@ -206,6 +246,10 @@ def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices):
         desc="Categories"
     ):
         stats[category]["theoretical_tasks"] = len(task_list)
+        category_candidates = [
+            name for name in verified_name_candidates(category)
+            if os.path.isdir(os.path.join(results_dir, name))
+        ]
         task_to_score[category] = {}
         task_details[category] = {}
 
@@ -244,28 +288,24 @@ def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices):
                     "traj.jsonl"
                 )
 
-                # Find actually existing candidate
-                for candidate_task_dir in candidate_task_dirs:
-
-                    candidate_result_path = os.path.join(
-                        results_dir,
-                        category,
-                        candidate_task_dir,
-                        "result.txt"
-                    )
-
-                    if os.path.exists(candidate_result_path):
-
-                        task_dir_name = candidate_task_dir
-                        result_path = candidate_result_path
-
-                        traj_path = os.path.join(
-                            results_dir,
-                            category,
-                            candidate_task_dir,
-                            "traj.jsonl"
+                # Prefer exact category/ID matches; fall back to verified aliases.
+                matched = False
+                for candidate_category in category_candidates:
+                    for candidate_task_dir in candidate_task_dirs:
+                        candidate_result_path = os.path.join(
+                            results_dir, candidate_category,
+                            candidate_task_dir, "result.txt"
                         )
-
+                        if os.path.isfile(candidate_result_path):
+                            task_dir_name = candidate_task_dir
+                            result_path = candidate_result_path
+                            traj_path = os.path.join(
+                                results_dir, candidate_category,
+                                candidate_task_dir, "traj.jsonl"
+                            )
+                            matched = True
+                            break
+                    if matched:
                         break
 
                 result_exists = os.path.exists(result_path)
@@ -349,16 +389,20 @@ def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices):
                 continue
 
             # --------------------------------------------------
-            # Mean mode, same as second script
+            # Aggregate selected samples within each task
             # --------------------------------------------------
 
-            avg_score = sum(used_scores) / len(used_scores)
+            if sample_agg == "max":
+                aggregated_score = max(used_scores)
+            else:
+                aggregated_score = sum(used_scores) / len(used_scores)
 
-            task_to_score[category][task_id] = avg_score
-            task_details[category][task_id]["avg_score"] = avg_score
+            task_to_score[category][task_id] = aggregated_score
+            task_details[category][task_id]["sample_agg"] = sample_agg
+            task_details[category][task_id]["aggregated_score"] = aggregated_score
 
             stats[category]["actual_tasks"] += 1
-            stats[category]["total_avg_score"] += avg_score
+            stats[category]["total_avg_score"] += aggregated_score
 
     return (
         stats,
@@ -368,9 +412,10 @@ def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices):
     )
 
 
-def print_results_table(stats, sample_indices):
+def print_results_table(stats, sample_indices, sample_agg="mean"):
     """格式化打印统计结果。"""
-    title = f"Mean of Samples {sample_indices}"
+    agg_name = sample_agg.upper()
+    title = f"{agg_name} of Samples {sample_indices}"
 
     try:
         from prettytable import PrettyTable
@@ -556,26 +601,33 @@ def print_results_table_basic(stats, title):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Calculate task scores by averaging the first selected samples."
+        description="Calculate task scores by aggregating the selected samples within each task."
     )
     parser.add_argument(
         "--results_dir",
         type=str,
-        default="results/vs2_agentnet_osworld_trainproj_8samples",
+        default='data/vs2_agentnet_osworld_trainproj_8samples',
         help="结果目录。",
     )
     parser.add_argument(
         "--task_file",
         type=str,
-        default="auto",
+        default='data/testset_full_clean.json',
         help="任务列表 JSON；设为 auto 时从 results_dir 自动发现任务。",
     )
     parser.add_argument(
         "--sample_indices",
-        type=int,
+        type=str,
         nargs="+",
-        default=[0, 1, 2],
-        help="要取平均的 rollout 下标，默认前 3 个：[0, 1, 2]；兼容 task_sample_N 与 task_audio_N。",
+        default=["0", "1", "2"],
+        help="参与聚合的 rollout 下标，默认前 3 个：[0, 1, 2]；兼容 task_sample_N 与 task_audio_N。传 auto 时自动扫描 results_dir 中所有 sample 下标。",
+    )
+    parser.add_argument(
+        "--sample_agg",
+        type=str,
+        choices=["mean", "max"],
+        default="mean",
+        help="任务内多个 sample 的聚合方式：mean 或 max。",
     )
     # parser.add_argument(
     #     "--allow_partial",
@@ -585,7 +637,12 @@ def main():
 
     args = parser.parse_args()
 
-    sample_indices = sorted(set(args.sample_indices))
+    try:
+        sample_indices = resolve_sample_indices(args.sample_indices, args.results_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
+
     tasks_by_cat = load_tasks(args.task_file, args.results_dir)
     if not tasks_by_cat:
         return
@@ -594,15 +651,17 @@ def main():
         args.results_dir,
         tasks_by_cat,
         sample_indices=sample_indices,
+        sample_agg=args.sample_agg,
         # require_all_samples=not args.allow_partial,
     )
 
-    print_results_table(stats, sample_indices)
+    print_results_table(stats, sample_indices, sample_agg=args.sample_agg)
 
     suffix = "_".join(str(x) for x in sample_indices)
-    unfinished_file = os.path.join(args.results_dir, f"unfinished_topavg_{suffix}.json")
-    score_file = os.path.join(args.results_dir, f"task_to_score_topavg_{suffix}.json")
-    details_file = os.path.join(args.results_dir, f"task_details_topavg_{suffix}.json")
+    mode_suffix = f"{args.sample_agg}_{suffix}"
+    unfinished_file = os.path.join(args.results_dir, f"unfinished_topavg_{mode_suffix}.json")
+    score_file = os.path.join(args.results_dir, f"task_to_score_topavg_{mode_suffix}.json")
+    details_file = os.path.join(args.results_dir, f"task_details_topavg_{mode_suffix}.json")
 
     with open(unfinished_file, "w") as f:
         json.dump(unfinished, f, indent=4, ensure_ascii=False)

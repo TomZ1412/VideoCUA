@@ -13,6 +13,7 @@ from typing import Dict, Optional, Sequence, List, Tuple, Union
 from io import BytesIO
 import base64
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from torchcodec.decoders import VideoDecoder, AudioDecoder
 import transformers
 
 from decord import VideoReader, cpu
+
 
 from joblib import Parallel, delayed, cpu_count
 
@@ -34,28 +36,35 @@ DEFAULT_AUDIO_TOKEN = "<audio>"
 
 local_rank = None
 
-generate_plan_template = """<video>
-You are given the above video tutorial teaching you how to perform a computer use task. The task is described as follows:
-{instruction}
+def multimodal_token_type_ids(input_ids, tokenizer):
+    token_types = torch.zeros_like(input_ids, dtype=torch.int32)
+    token_types.masked_fill_(input_ids == tokenizer.convert_tokens_to_ids("<|image_pad|>"), 1)
+    token_types.masked_fill_(input_ids == tokenizer.convert_tokens_to_ids("<|video_pad|>"), 2)
+    return token_types
 
-The starting point of the task is shown in the following screenshot:
-<image>
 
-Use ONLY the knowledge from the video, describe how to perform the task step by step starting from the current screenshot.
-The video may not contain the entire task. It may only contain a part of the task. Just describe the part of the task that is shown in the video.
+class _TOSClient:
+    def __init__(self):
+        self.client = None
 
-For example, for a long task where part of it requires you to login with username and password that is included in the video, you should output the following:
-When you want to log in, you should first click the login button on the left menu bar. Then, this will direct you to the login page. You need to enter your username and password. You should first click on the textbox with a word "Username" and then enter your username. Then, click on the textbox with a word "Password" and enter your password.
+    def get_object(self, key):
+        if self.client is None:
+            import bytedtos
+            access_key = os.environ.get("TOS_ACCESS_KEY")
+            if not access_key:
+                raise ValueError("TOS_ACCESS_KEY is required for remote TOS objects")
+            self.client = bytedtos.Client(
+                os.environ.get("TOS_BUCKET", "YOUR_TOS_BUCKET"), access_key,
+                service=os.environ.get("TOS_SERVICE", "YOUR_TOS_SERVICE"),
+                cluster=os.environ.get("TOS_CLUSTER", "default"),
+                idc=os.environ.get("TOS_IDC", "maliva"), timeout=60,
+                connect_timeout=10, connection_pool_size=16)
+        return self.client.get_object(key)
 
-### Rules
-1. Do not use your own knowledge. Just describe what you can learn from the video.
-2. Always output step by step, and at the end of each step, describe what screen status you are expected to get.
-3. Try to gather as much information/procedural knowledge as possible from the video. 
-4. If the video contains the entire task, describe the entire task.
-5. If the video really does not contain anything meaningful, output "I can not get useful knowledge from the video".
 
-Directly output your step-by-step description.
-"""
+def get_tos_client():
+    return _TOSClient()
+
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -147,32 +156,28 @@ def generate_id_target(
     grid_thw_video, 
     audio_lengths, 
     tokenizer, 
-    target_role,
     merge_size: int = 2,
     second_per_grid_ts: List = [],
     fps: List = [],
     frame_idx: List = [],
-    total_timestamps: int = 5000,
-    n_full_res: int = 0,
+    thinking: bool = False,
+    inference: bool = False,
 ):
-    visual_replicate_index_image = 0
     visual_replicate_index_video = 0
-    roles = {"human": "user", "gpt": "assistant", "chosen": "assistant", "reject": "assistant"}
+    visual_replicate_index_image = 0
+    roles = {"human": "user", "gpt": "assistant"}
     system_message = "You are a helpful assistant."
-    input_id, target = [], []
 
-    input_id += tokenizer.apply_chat_template(
-        [{"role": "system", "content": system_message}]
-    )
-    target += [IGNORE_INDEX] * len(input_id)
-    for idx, conv in enumerate(source):
+    messages = [{"role": "system", "content": system_message}]
+    total_timestamp = []
+    for conv in source:
         try:
             role = conv["role"]
             content = conv["content"]
         except:
             role = conv["from"]
             content = conv["value"]
-        if role not in ["human", target_role]:
+        if role not in ["human", "gpt"]:
             continue
 
         role = roles.get(role, role)
@@ -184,11 +189,12 @@ def generate_id_target(
                     new_parts.append(parts[i])
                     replacement = (
                         "<|vision_start|>"
-                        + f"<|image_pad|>"
-                        * grid_thw_image[idx//2]
+                        + "<|image_pad|>"
+                        * grid_thw_image[visual_replicate_index_image]
                         + "<|vision_end|>"
                     )
                     new_parts.append(replacement)
+                    visual_replicate_index_image += 1
                 new_parts.append(parts[-1])
                 content = "".join(new_parts)
 
@@ -201,79 +207,55 @@ def generate_id_target(
                 ]
                 if audio_lengths is None:
                     for i in range(len(parts) - 1):
+                        video_idx = visual_replicate_index_video
                         curr_timestamp = _calculate_timestamps(
-                            frame_idx[i],
-                            fps[i],
+                            frame_idx[video_idx],
+                            fps[video_idx],
                             merge_size,
                         )
+                        total_timestamp += [round(x, 1) for x in curr_timestamp]
                         new_parts.append(parts[i])
+                        # replacement = (
+                        #     "<|vision_start|>"
+                        #     + f"<|video_pad|>"
+                        #     * grid_thw_video[i]
+                        #     + "<|vision_end|>"
+                        # )
                         replacement = ""
-                        in_idx = None
-                        if grid_thw_video[i][0] > total_timestamps:
-                            stepsize = torch.ceil(grid_thw_video[i][0] / total_timestamps).item()
-                            in_idx = [i for i in range(0, grid_thw_video[i][0], int(stepsize))]
-                            in_idx.append(grid_thw_video[i][0])
-                            in_idx = np.array(in_idx)
-                        for idx in range(grid_thw_video[i][0]):
-                            if in_idx is None or idx in in_idx:
-                                if in_idx is not None and idx != 0:
-                                    replacement += "<|vision_end|>"
-                                curr_time = curr_timestamp[idx]
-                                replacement += f"<{curr_time:.1f} seconds>"
-                                replacement += "<|vision_start|>"
-                            replacement += "<|video_pad|>" * frame_seq_length[i]
-                            if in_idx is None:
-                                replacement += "<|vision_end|>"
-                        if not replacement.endswith("<|vision_end|>"):
+                        for idx in range(grid_thw_video[video_idx][0]):
+                            curr_time = curr_timestamp[idx]
+                            replacement += f"<{curr_time:.1f} seconds>"
+                            replacement += "<|vision_start|>"
+                            replacement += "<|video_pad|>" * frame_seq_length[video_idx]
                             replacement += "<|vision_end|>"
                         new_parts.append(replacement)
+                        visual_replicate_index_video += 1
                     new_parts.append(parts[-1])
                     content = "".join(new_parts)
                 else:
                     for i in range(len(parts) - 1):
+                        video_idx = visual_replicate_index_video
                         curr_timestamp = _calculate_timestamps(
-                            frame_idx[i],
-                            fps[i],
+                            frame_idx[video_idx],
+                            fps[video_idx],
                             merge_size,
                         )
+                        total_timestamp += [round(x, 1) for x in curr_timestamp]
                         new_parts.append(parts[i])
                         if second_per_grid_ts is None:
                             per_timestep_audio_len = split_into_groups(audio_lengths, [grid_thw_video[i][0] for i in range(len(grid_thw_video))])
                         else:
                             per_timestep_audio_len = split_into_groups(audio_lengths, [grid_thw_video[i][0] for i in range(len(grid_thw_video))], [ts[0] for ts in second_per_grid_ts])
                         replacement = ""
-                        # print(len(curr_timestamp), grid_thw_video)
-                        in_idx = None
-                        if grid_thw_video[i][0] > total_timestamps:
-                            stepsize = torch.ceil(grid_thw_video[i][0] / total_timestamps).item()
-                            in_idx = [i for i in range(0, grid_thw_video[i][0], int(stepsize))]
-                            in_idx.append(grid_thw_video[i][0])
-                            in_idx = np.array(in_idx)
-                            # in_idx = np.unique(np.linspace(0, grid_thw_video[i][0]-1, total_timestamps, dtype=int))
-
-                        cum_audio_len = 0
-                        for idx in range(grid_thw_video[i][0]):
-                            if in_idx is None or idx in in_idx:
-                                if in_idx is not None and idx != 0:
-                                    replacement += f"<|audio_pad|>" * cum_audio_len
-                                    cum_audio_len = 0
-                                    replacement += "<|vision_end|>"
-                                curr_time = curr_timestamp[idx]
-                                replacement += f"<{curr_time:.1f} seconds>"
-                                replacement += "<|vision_start|>"
-                            replacement += "<|video_pad|>" * frame_seq_length[i]
-                            if in_idx is None:
-                                replacement += f"<|audio_pad|>" * per_timestep_audio_len[i][idx]
-                            else:
-                                cum_audio_len += per_timestep_audio_len[i][idx]
-                            if in_idx is None:
-                                replacement += "<|vision_end|>"
-                        if not replacement.endswith("<|vision_end|>"):
-                            if cum_audio_len > 0:
-                                replacement += f"<|audio_pad|>" * cum_audio_len
+                        for idx in range(grid_thw_video[video_idx][0]):
+                            curr_time = curr_timestamp[idx]
+                            replacement += f"<{curr_time:.1f} seconds>"
+                            replacement += "<|vision_start|>"
+                            replacement += "<|video_pad|>" * frame_seq_length[video_idx]
+                            replacement += "<|audio_pad|>" * per_timestep_audio_len[video_idx][idx]
                             replacement += "<|vision_end|>"
-
                         new_parts.append(replacement)
+                        visual_replicate_index_video += 1
                     new_parts.append(parts[-1])
                     content = "".join(new_parts)
                             
@@ -283,22 +265,56 @@ def generate_id_target(
                 new_parts = []
                 for i in range(len(parts) - 1):
                     new_parts.append(parts[i])
-                    replacement = f"<|audio_pad|>" * audio_lengths[i] # remove vision_start for minimum change on rope index
+                    replacement = "<|audio_pad|>" * audio_lengths[i] # remove vision_start for minimum change on rope index
                     new_parts.append(replacement)
                 new_parts.append(parts[-1])
                 content = "".join(new_parts)
-        conv = [{"role": role, "content": content}]
-        encode_id = tokenizer.apply_chat_template(conv)
-        input_id += encode_id
-        if role in ["user", "system"]:
-            target += [IGNORE_INDEX] * len(encode_id)
-        elif n_full_res > 0 and idx <= len(source) - n_full_res * 2:
-            target += [IGNORE_INDEX] * len(encode_id)
-        else:
-            target_mask = encode_id.copy()
-            target_mask[:3] = [IGNORE_INDEX] * 3
-            target += target_mask
-    return input_id, target
+        if role == "assistant" and thinking and "</think>" not in content:
+            raise ValueError("thinking=true requires reasoning, </think>, and a final answer")
+        messages.append({"role": role, "content": content})
+
+    if inference:
+        if messages[-1]["role"] == "assistant":
+            messages.pop()
+        if messages[-1]["role"] != "user":
+            raise ValueError("Inference prompt must end with a user turn")
+        input_id = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=thinking, return_dict=True
+        )["input_ids"]
+        return input_id, [IGNORE_INDEX] * len(input_id), total_timestamp
+
+    input_id = tokenizer.apply_chat_template(messages, return_dict=True)["input_ids"]
+    target = input_id.copy()
+    start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    think_id = tokenizer.convert_tokens_to_ids("<think>")
+    end_think_id = tokenizer.convert_tokens_to_ids("</think>")
+    assistant_header = tokenizer("<|im_start|>assistant\n", add_special_tokens=False)["input_ids"]
+    starts = [i for i, token in enumerate(input_id) if token == start_id]
+    if len(starts) != len(messages):
+        raise ValueError("Chat template message boundaries do not match input conversations")
+    for message, start, next_start in zip(messages, starts, starts[1:] + [len(input_id)]):
+        if message["role"] != "assistant":
+            target[start:next_start] = [IGNORE_INDEX] * (next_start - start)
+            continue
+        if input_id[start:start + len(assistant_header)] != assistant_header:
+            raise ValueError("Assistant header differs from the model chat template")
+        target[start:start + len(assistant_header)] = [IGNORE_INDEX] * len(assistant_header)
+        end = input_id.index(end_id, start, next_start)
+        if not thinking:
+            if end_think_id in input_id[start:end]:
+                close = input_id.index(end_think_id, start, end)
+                prefix_end = close + 1
+                while prefix_end < end and tokenizer.decode([input_id[prefix_end]]).isspace():
+                    prefix_end += 1
+                target[start:prefix_end] = [IGNORE_INDEX] * (prefix_end - start)
+        elif think_id in input_id[start:end]:
+            opening = input_id.index(think_id, start, end)
+            prefix_end = opening + 1
+            while prefix_end < end and tokenizer.decode([input_id[prefix_end]]).isspace():
+                prefix_end += 1
+            target[start:prefix_end] = [IGNORE_INDEX] * (prefix_end - start)
+    return input_id, target, total_timestamp
 
 
 def preprocess_qwen_3_visual(
@@ -311,18 +327,20 @@ def preprocess_qwen_3_visual(
     second_per_grid_ts: List = [],
     fps: List = [],
     frame_idx: List = [],
-    total_timestamps: int = 5000,
-    n_full_res: int = 0,
+    thinking_flags: List[bool] = None,
+    inference: bool = False,
 ) -> Dict:
-    if second_per_grid_ts is not None and isinstance(second_per_grid_ts, list) and not isinstance(second_per_grid_ts[0], list):
+    if second_per_grid_ts != [] and isinstance(second_per_grid_ts, list) and not isinstance(second_per_grid_ts[0], list):
         second_per_grid_ts = [second_per_grid_ts]
-    tokenizer = copy.deepcopy(tokenizer)
-    chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-    tokenizer.chat_template = chat_template
+    # Tokenization below does not modify the vocabulary or chat template. Each
+    # DataLoader worker already owns its tokenizer; cloning its entire vocabulary
+    # for every sample is much more expensive than tokenization itself.
+    if thinking_flags is None:
+        thinking_flags = [False] * len(sources)
+    if len(thinking_flags) != len(sources) or any(type(flag) is not bool for flag in thinking_flags):
+        raise ValueError("thinking_flags must contain one boolean per sample")
+    input_ids, targets = [], []
 
-    input_ids, targets, chosen_ids, chosen_targets, reject_ids, reject_targets = [], [], [], [], [], []
-
-    is_dpo_data = False
     for i, source in enumerate(sources):
         try:
             if source[0]["from"] != "human":
@@ -330,30 +348,18 @@ def preprocess_qwen_3_visual(
         except:
             print(sources)
 
-        for conv in source:
-            try:
-                role = conv["role"]
-                content = conv["content"]
-            except:
-                role = conv["from"]
-                content = conv["value"]
-            if role in ["chosen", "reject"]:
-                is_dpo_data = True
-                break
-
-        input_id, target = generate_id_target(
+        input_id, target, total_timestamp = generate_id_target(
             source,
             grid_thw_image,
             grid_thw_video,
             audio_lengths,
             tokenizer,
-            "gpt",
             merge_size,
             second_per_grid_ts,
             fps,
             frame_idx,
-            total_timestamps,
-            n_full_res,
+            thinking_flags[i],
+            inference=inference,
         )
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
         input_ids.append(input_id)
@@ -361,37 +367,21 @@ def preprocess_qwen_3_visual(
 
     input_ids = torch.tensor(input_ids, dtype=torch.long)
     targets = torch.tensor(targets, dtype=torch.long)
-    if is_dpo_data:
-        chosen_ids = torch.tensor(chosen_ids, dtype=torch.long)
-        chosen_targets = torch.tensor(chosen_targets, dtype=torch.long)
-        reject_ids = torch.tensor(reject_ids, dtype=torch.long)
-        reject_targets = torch.tensor(reject_targets, dtype=torch.long)
-    else:
-        chosen_ids = None
-        chosen_targets = None
-        reject_ids = None
-        reject_targets = None
 
-    
     return dict(
         input_ids=input_ids,
         labels=targets,
-        chosen_ids=chosen_ids,
-        chosen_labels=chosen_targets,
-        reject_ids=reject_ids,
-        reject_labels=reject_targets,
+        timestamp=total_timestamp
     )
 
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args, validation=False):
+    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args, inference: bool = False, samples=None):
         super(LazySupervisedDataset, self).__init__()
 
-        self.validation = validation
-        dataset = data_args.dataset_use.split(",") if not validation else [data_args.validation_data]
-        dataset_list = dataset
+        dataset_list = data_args.dataset_use.split(",") if samples is None else []
         rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
             data_args, "video_max_total_pixels", 1664 * 28 * 28
@@ -399,11 +389,12 @@ class LazySupervisedDataset(Dataset):
         self.video_min_total_pixels = getattr(
             data_args, "video_min_total_pixels", 256 * 28 * 28
         )
-        self.model_type = data_args.model_type
 
-        list_data_dict = []
+        list_data_dict = list(samples) if samples is not None else []
 
         for data in dataset_list:
+            if data == "":
+                continue
             file_format = data.split(".")[-1]
             if file_format == "jsonl":
                 annotations = read_jsonl(data)
@@ -411,16 +402,35 @@ class LazySupervisedDataset(Dataset):
                 annotations = json.load(open(data, "r"))
             list_data_dict += annotations
 
+        self.source_data = copy.deepcopy(list_data_dict) if inference else None
+        self.references = []
+        if inference:
+            list_data_dict = copy.deepcopy(list_data_dict)
+            for d in list_data_dict:
+                if "batch_audio" in d:
+                    raise ValueError("Flatten batch_audio into individual examples before inference")
+                for turn in d["conversations"]:
+                    role = turn.get("from", turn.get("role"))
+                    turn["from"] = {"user": "human", "assistant": "gpt"}.get(role, role)
+                    turn["value"] = turn.get("value", turn.get("content"))
+                    turn.pop("role", None)
+                    turn.pop("content", None)
+                conversations = d["conversations"]
+                ref = conversations.pop()["value"] if conversations and conversations[-1]["from"] == "gpt" else None
+                if not conversations or conversations[-1]["from"] != "human":
+                    raise ValueError("Inference prompt must end with a human turn")
+                self.references.append(ref)
+
         for d in list_data_dict:
-            if "<image>" in d["conversations"][0]["value"] and not "images" in d and ("video" in d or "tos_key" in d):
+            if "<image>" in d["conversations"][0]["value"] and not "image" in d and ("video" in d or "tos_key" in d or "videos" in d):
                 d["conversations"][0]["value"] = d["conversations"][0]["value"].replace(
                     "<image>", "<video>"
                 )
-            if "<image>" in d["conversations"][0]["value"] and not "images" in d and not "video" in d and ("audio" in d or "tos_audio" in d):
+            if "<image>" in d["conversations"][0]["value"] and not "image" in d and not "video" in d and ("audio" in d or "tos_audio" in d):
                 d["conversations"][0]["value"] = d["conversations"][0]["value"].replace(
                     "<image>", "<audio>"
                 )
-            if ("video" in d or "tos_key" in d) and (not "<image>" in d["conversations"][0]["value"]) and (not "<video>" in d["conversations"][0]["value"]):
+            if ("video" in d or "tos_key" in d or "videos" in d) and (not "<image>" in d["conversations"][0]["value"]) and (not "<video>" in d["conversations"][0]["value"]):
                 d["conversations"][0]["value"] = "<video>\n" + d["conversations"][0]["value"]
             if "batch_audio" in d:
                 for idx in range(len(d["batch_audio"])):
@@ -439,6 +449,7 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.inference = inference
         self.data_args.video_processor.max_pixels = data_args.video_max_frame_pixels
         self.data_args.video_processor.min_pixels = data_args.video_min_frame_pixels
         self.data_args.video_processor.size["longest_edge"] = data_args.video_max_frame_pixels
@@ -450,13 +461,23 @@ class LazySupervisedDataset(Dataset):
         self.data_args.image_processor.size["longest_edge"] = data_args.max_pixels
         self.data_args.image_processor.size["shortest_edge"] = data_args.min_pixels
 
-        # Public verifier inputs use local media paths. Internal TOS access is not supported.
-        self.cli = None
+        self.cli = get_tos_client()
 
-        self.type_list = ["av" if (("video" in sample or "tos_key" in sample) and "use_audio" in sample and sample["use_audio"]) else "v" if ("video" in sample or "tos_key" in sample) else "a" if ("audio" in sample or "tos_audio" in sample or "batch_audio" in sample) else "t" for sample in self.list_data_dict]
+        self.type_list = ["av" if (("video" in sample or "tos_key" in sample or "videos" in sample) and "use_audio" in sample and sample["use_audio"]) else "v" if ("video" in sample or "tos_key" in sample or "videos" in sample) else "a" if ("audio" in sample or "tos_audio" in sample or "batch_audio" in sample) else "t" for sample in self.list_data_dict]
+        self.cached_token_lengths = None
+        if getattr(data_args, "length_cache", None) and not inference:
+            from qwenvl.data.video_token_map import VideoTokenMap
+            self.cached_token_lengths = VideoTokenMap.read(data_args.length_cache).lengths_for(self.list_data_dict)
 
     def __len__(self):
         return len(self.list_data_dict)
+
+    def set_epoch(self, epoch):
+        # Accelerate's skip_first_batches adds a wrapper that can hide the sampler.
+        # Its dataset fallback preserves epoch seeding when resuming mid-epoch.
+        sampler = getattr(self, "_length_sampler", None)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
 
     @property
     def lengths(self):
@@ -477,19 +498,10 @@ class LazySupervisedDataset(Dataset):
                 len(conv["value"].split()) for conv in sample["conversations"]
             )
             cur_len = (
-                cur_len if ("image" in sample) or ("video" in sample) or ("tos_key" in sample) else -cur_len
+                cur_len if ("image" in sample) or ("video" in sample) or ("tos_key" in sample) or ("videos" in sample) else -cur_len
             )
             length_list.append(cur_len)
         return length_list
-
-    @property
-    def pre_calculated_length(self):
-        if "num_tokens" in self.list_data_dict[0]:
-            length_list = [sample["num_tokens"] for sample in self.list_data_dict]
-            return np.array(length_list)
-        else:
-            print("No pre-calculated length available.")
-            return np.array([1] * len(self.list_data_dict))
 
     def process_audio(self, audio_file, timestamps=None):
         try:
@@ -499,7 +511,7 @@ class LazySupervisedDataset(Dataset):
                 "return_attention_mask": False,
             }
             processor = copy.deepcopy(self.data_args.audio_processor)
-            if isinstance(audio_file, list):
+            if False:
                 audio_data = []
                 if timestamps is None:
                     for file in audio_file:
@@ -547,7 +559,7 @@ class LazySupervisedDataset(Dataset):
             return None, None
 
     def process_audio_tos(self, audio_file, timestamps=None):
-        if not isinstance(audio_file, list):
+        if True:
             for _ in range(100):
                 try:
                     resp = self.cli.get_object(audio_file)
@@ -574,113 +586,59 @@ class LazySupervisedDataset(Dataset):
             return self.process_audio(audio_file_tos, timestamps)
 
 
-    def process_image_unified(self, image_file, last_one=False):
+    def process_image_unified(self, image_file):
         processor = copy.deepcopy(self.data_args.image_processor)
         image = Image.open(image_file).convert("RGB")
-
-        if not last_one and self.data_args.n_full_res > 0:
-            orig_pixels = processor.max_pixels
-            processor.max_pixels = self.data_args.video_max_frame_pixels
 
         visual_processed = processor.preprocess(image, return_tensors="pt")
         image_tensor = visual_processed["pixel_values"]
         if isinstance(image_tensor, List):
             image_tensor = image_tensor[0]
         grid_thw = visual_processed["image_grid_thw"][0]
-        if not last_one and self.data_args.n_full_res > 0:
-            processor.max_pixels = orig_pixels
-        return image_tensor, grid_thw, image.size
+        return image_tensor, grid_thw
 
-    def process_video(self, video_file, timestamps=None, video_max_frames=0):
+    def process_video(self, video_file, timestamps=None, max_frame=None, max_pixel=None, interval=None, video_bytes=None):
         torchcodec_video = None
         try:
-            torchcodec_video = self.video_torchcodec(video_file, timestamps, video_max_frames=video_max_frames)
+            torchcodec_video = self.video_torchcodec(video_bytes if video_bytes is not None else video_file, timestamps, max_frame, max_pixel, interval)
             return torchcodec_video
         except:
             try:
-                decord_video = self.read_video_decord(video_file, timestamps, video_max_frames=video_max_frames)
+                decord_video = self.read_video_decord(BytesIO(video_bytes) if video_bytes is not None else video_file, timestamps, max_frame, max_pixel, interval)
                 return decord_video
             except Exception as e:
                 print(f"torchcodec attempt failed: {e}")
                 raise e
 
-    def process_video_tos(self, video_file, timestamps=None, video_max_frames=0):
+    def process_video_tos(self, video_file, timestamps=None, max_frame=None, max_pixel=None, interval=None, video_bytes=None):
         torchcodec_video = None
-        for _ in range(100):
-            try:
-                resp = self.cli.get_object(video_file)
-                assert len(resp.data) == int(resp.headers['Content-Length'])
-                video_data = resp.data
-            except:
-                continue
-            break
+        video_data = video_bytes
+        if video_data is None:
+            for _ in range(100):
+                try:
+                    resp = self.cli.get_object(video_file)
+                    assert len(resp.data) == int(resp.headers["Content-Length"])
+                    video_data = resp.data
+                except:
+                    continue
+                break
         try:
-            torchcodec_video = self.video_torchcodec(video_data, timestamps, video_max_frames=video_max_frames)
+            torchcodec_video = self.video_torchcodec(video_data, timestamps, max_frame, max_pixel, interval)
             return torchcodec_video
         except:
             try:
-                decord_video = self.read_video_decord(BytesIO(video_data), timestamps, video_max_frames=video_max_frames)
+                decord_video = self.read_video_decord(BytesIO(video_data), timestamps, max_frame, max_pixel, interval)
                 return decord_video
             except Exception as e:
                 print(f"torchcodec attempt failed: {e}")
                 raise e
-    
-    def process_video_sharegpt(self, video_file, pos):
-        for _ in range(100):
-            try:
-                resp = self.cli.get_object(video_file)
-                assert len(resp.data) == int(resp.headers['Content-Length'])
-                video_data = resp.data
-            except:
-                continue
-            break
 
-        start = 0 
-        end = None
-        data_slices = []
-        for index in pos:
-            end = index
-            image_data = video_data[start:end]
-            data_slices.append(image_data)
-            start = end
-        
-        ori_fps = 16
-        all_frames = []
-        for idx in range(len(data_slices)):
-            image_data = data_slices[idx]
-            img = Image.open(BytesIO(image_data))
-            frame = np.array(img.convert('RGB'))
-            all_frames.extend([frame] * ori_fps)
-
-        video_length = len(all_frames) / 16
-        interval = getattr(self.data_args, "base_interval", 4)
-        num_frames_to_sample = round(video_length / interval)
-        video_min_frames = getattr(self.data_args, "video_min_frames", 4)
-        video_max_frames = getattr(self.data_args, "video_max_frames", 8)
-        
-        target_frames = min(
-            max(num_frames_to_sample, video_min_frames), video_max_frames
-        )
-
-        total_frames = len(all_frames)
-
-        frame_idx = np.linspace(0, total_frames - 1, target_frames, dtype=int)
-        frame_idx = np.unique(frame_idx)
-
-        video = []
-        for idx in frame_idx:
-            frame = all_frames[idx]
-            video.append(frame)
-
-        video = np.stack(video)
-
-        return self.process_video_frames(video, frame_idx, video_length)
-
-    def read_video_decord(self, video_file, timestamps, video_max_frames=0):
+    def read_video_decord(self, video_file, timestamps, max_frame=None, max_pixel=None, interval=None):
         vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
         total_frame_num = len(vr)
         avg_fps = vr.get_avg_fps()
-        interval = getattr(self.data_args, "base_interval", 4)
+        if interval is None:
+            interval = getattr(self.data_args, "base_interval", 4)
         video_length = total_frame_num / avg_fps
         start_idx = 0
         end_idx = total_frame_num - 1
@@ -696,28 +654,31 @@ class LazySupervisedDataset(Dataset):
         num_frames_to_sample = round(video_length / interval)
         
         video_min_frames = getattr(self.data_args, "video_min_frames", 4)
-        if video_max_frames == 0:
+        if max_frame is None:
             video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+        else:
+            video_max_frames = max_frame
         target_frames = min(
             max(num_frames_to_sample, video_min_frames), video_max_frames
         )
         frame_idx = np.linspace(start_idx, end_idx, target_frames, dtype=int)
-        frame_idx = np.unique(frame_idx)
+        frame_idx = np.unique(frame_idx).tolist()
         video = vr.get_batch(frame_idx).asnumpy().transpose(0, 3, 1, 2)
-        return *self.process_video_frames(video, frame_idx, video_length), avg_fps, frame_idx
+        return *self.process_video_frames(video, frame_idx, video_length, max_frame, max_pixel), avg_fps, frame_idx
 
-    def video_torchcodec(self, video_file, timestamps, video_max_frames=0):
+    def video_torchcodec(self, video_file, timestamps, max_frame=None, max_pixel=None, interval=None):
         device = "cpu"  # or e.g. "cuda"
         decoder = VideoDecoder(video_file, device=device)
         total_frame_num = decoder.metadata.num_frames
         avg_fps = decoder.metadata.average_fps
         video_length = total_frame_num / avg_fps
-        interval = getattr(self.data_args, "base_interval", 4)
+        if interval is None:
+            interval = getattr(self.data_args, "base_interval", 4)
         start_idx = 0
         end_idx = total_frame_num - 1
         if timestamps is not None:
-            timestamps[0] = min(max(timestamps[0], 0), video_length)
-            timestamps[1] = min(max(timestamps[1], 0), video_length)
+            timestamps[0] = min(max(timestamps[0], 0), video_length - 1)
+            timestamps[1] = min(max(timestamps[1], timestamps[0] + 1), video_length)
             start_idx = round(timestamps[0] * avg_fps)
             end_idx = round(timestamps[1] * avg_fps)
             start_idx = min(max(start_idx, 0), total_frame_num - 1)
@@ -726,8 +687,10 @@ class LazySupervisedDataset(Dataset):
 
         num_frames_to_sample = round(video_length / interval)
         video_min_frames = getattr(self.data_args, "video_min_frames", 4)
-        if video_max_frames == 0:
+        if max_frame is None:
             video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+        else:
+            video_max_frames = max_frame
 
         target_frames = min(
             max(num_frames_to_sample, video_min_frames), video_max_frames
@@ -737,13 +700,16 @@ class LazySupervisedDataset(Dataset):
         # frame_batch = decoder.get_frames_at(indices=frame_idx.tolist())
         frame_batch = decode_with_multithreading(indices=frame_idx.tolist(), num_threads=8, video_path=video_file)
         video = frame_batch.data.cpu().numpy()
-        return *self.process_video_frames(video, frame_idx, video_length), avg_fps, frame_idx
+        return *self.process_video_frames(video, frame_idx, video_length, max_frame, max_pixel), avg_fps, frame_idx
 
-    def process_video_frames(self, video, frame_idx, video_length):
+    def process_video_frames(self, video, frame_idx, video_length, max_frame=None, max_pixel=None):
         fps = len(frame_idx) / video_length
         processor = copy.deepcopy(self.data_args.video_processor)
-        # max_pixels = getattr(self.data_args, "video_max_frames", 8) * getattr(self.data_args, "video_max_frame_pixels", 8)
-        max_pixels = len(frame_idx) * getattr(self.data_args, "video_max_frame_pixels", 8)
+        if max_frame is None:
+            max_frame = getattr(self.data_args, "video_max_frames", 8)
+        if max_pixel is None:
+            max_pixel = getattr(self.data_args, "video_max_frame_pixels", 8)
+        max_pixels = max_frame * max_pixel
         processor.max_pixels = max_pixels
         processor.min_pixels = self.data_args.video_min_frame_pixels
         processor.size["longest_edge"] = processor.max_pixels
@@ -756,57 +722,29 @@ class LazySupervisedDataset(Dataset):
         ] * len(grid_thw)
         return video_tensor, grid_thw, second_per_grid_ts
 
+    def __getitems__(self, indices):
+        """Load a batch with eight threads, preserving the input index order."""
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            return list(executor.map(self.__getitem__, indices))
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        num_base_retries = 3
-
-        # try the current sample first
-        for attempt_idx in range(num_base_retries):
+        if self.inference:
+            # Never silently replace a failed inference example with another one.
+            item = self._get_item([self.list_data_dict[i]], no_meta=True)
+            item["mm_token_type_ids"] = multimodal_token_type_ids(item["input_ids"], self.tokenizer)
+            item["ref"] = self.references[i]
+            return item
+        original_type = self.type_list[i]
+        for attempt_idx in range(10):
             try:
-                sources = self.list_data_dict[i]
-                if isinstance(i, int):
-                    sources = [sources]
-                assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-                sample = self._get_item(sources)
-                return sample
+                return self._get_item([self.list_data_dict[i]])
             except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
-                print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
-                # raise e
-                time.sleep(1)
+                print(f"[Try #{attempt_idx}] Failed to fetch sample {i}: {e}")
+                candidates = [n for n, sample_type in enumerate(self.type_list) if sample_type == original_type]
+                i = random.choice(candidates)
+        raise RuntimeError(f"Could not load a {original_type} sample after 10 attempts")
 
-        if self.data_args.run_test:
-            item_to_return = self.__getitem__(random.randint(0, len(self) - 1))
-            item_to_return["should_use"] = False
-            return item_to_return
-        else:
-            print(f"Failed to fetch sample {i}. Try another sample.")
-            new_idx = random.randint(0, len(self) - 1)
-            while self.type_list[new_idx] != self.type_list[i]:
-                new_idx = random.randint(0, len(self) - 1)
-            return self.__getitem__(new_idx)
-
-    def downsample(self, video, video_grid_thw, second_per_grid_ts, fps, frame_idx):
-        video_max_frames = getattr(self.data_args, "video_max_frames", 8)
-        video = torch.cat(video, dim=0)
-        new_video_grid_thw = video_grid_thw[0]
-        new_video_grid_thw[0] = torch.stack(video_grid_thw).sum(dim=0)[0]
-        second_per_grid_ts = second_per_grid_ts[0]
-        fps = [2 / second_per_grid_ts[0]]
-        frame_idx = np.array([i for i in range(new_video_grid_thw[0]*2)])
-        frame_idx = frame_idx.astype(int)
-        video = video.view(new_video_grid_thw.tolist()+[-1])
-        if len(frame_idx) > video_max_frames:
-            downsample_frame_ids = np.unique(np.linspace(0, len(frame_idx)-1, video_max_frames, dtype=int))
-            downsample_video_ids = np.unique(np.linspace(0, new_video_grid_thw[0]-1, video_max_frames//2, dtype=int))
-            downsample_ratio = len(frame_idx) / video_max_frames
-            video = video[downsample_video_ids]
-            new_video_grid_thw[0] = video_max_frames // 2
-            second_per_grid_ts = [s * downsample_ratio for s in second_per_grid_ts]
-            frame_idx = frame_idx[downsample_frame_ids]
-        video = video.view(-1, video.size(-1))
-        return video, new_video_grid_thw, second_per_grid_ts, fps, frame_idx
-
-    def _get_item(self, sources) -> Dict[str, torch.Tensor]:
+    def _get_item(self, sources, inference: bool = False, no_meta: bool = False) -> Dict[str, torch.Tensor]:
         try:
             if "batch_audio" in sources[0]:
                 # return [
@@ -825,33 +763,24 @@ class LazySupervisedDataset(Dataset):
             audio_lengths = None
             fps=None
             frame_idx = None
+            video_bytes = None
 
-            if self.data_args.n_full_res > 0 and not self.validation:
-                max_end = max(len(sources[0]["conversations"])//2, self.data_args.n_full_res)
-                end = random.randint(self.data_args.n_full_res, max_end)
-                sources[0]["conversations"] = sources[0]["conversations"][:end*2]
-                if "images" in sources[0]:
-                    sources[0]["images"] = sources[0]["images"][:end]
-
-            if "images" in sources[0]:
-                image_file = sources[0]["images"]
+            if "image" in sources[0]:
+                image_file = sources[0]["image"]
                 if isinstance(image_file, List):
                     if len(image_file) > 1:
                         image_file = [
                             file for file in image_file
                         ]
-                        n_full_res = len(image_file) - self.data_args.n_full_res
-                        results = [self.process_image_unified(file, last_one=True if img_idx >= n_full_res else False) for img_idx, file in enumerate(image_file)]
-                        image, grid_thw, sizes = zip(*results)
+                        results = [self.process_image_unified(file) for file in image_file]
+                        image, grid_thw = zip(*results)
                     else:
                         image_file = image_file[0]
-                        image, grid_thw, size = self.process_image_unified(image_file)
+                        image, grid_thw = self.process_image_unified(image_file)
                         image = [image]
-                        sizes = [size]
                 else:
-                    image, grid_thw, size = self.process_image_unified(image_file)
+                    image, grid_thw = self.process_image_unified(image_file)
                     image = [image]
-                    sizes = [size]
                 grid_thw_merged = copy.deepcopy(grid_thw)
                 if not isinstance(grid_thw, Sequence):
                     grid_thw_merged = [grid_thw_merged]
@@ -860,181 +789,214 @@ class LazySupervisedDataset(Dataset):
                     merged_thw.prod() // self.data_args.image_processor.merge_size**2
                     for merged_thw in grid_thw_merged
                 ]
-            if "video" in sources[0] or "tos_key" in sources[0]:
-                timestamps = sources[0]["conversations"][0].get("timestamps", None)
-                if "tos_key" in sources[0]:
-                    video_file = sources[0]["tos_key"]
-                    if isinstance(video_file, List):
-                        if len(video_file) > 1:
-                            video_file = [
-                                file for file in video_file
-                            ]
-                            if timestamps is not None:
-                                results = [self.process_video_tos(file, ts) for file, ts in zip(video_file, timestamps)]
-                            else:
-                                results = [self.process_video_tos(file, video_max_frames=100000) for file in video_file]
-                            video, video_grid_thw, second_per_grid_ts, fps, frame_idx = zip(*results)
-                            video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.downsample(
-                                video, video_grid_thw, second_per_grid_ts, fps, frame_idx
-                            )
-                            video = [video]
-                            frame_idx = [frame_idx]
-                        else:
-                            video_file = video_file[0]
-                            video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.process_video_tos(
-                                video_file, timestamps
-                            )
-                            video = [video]
-                            fps = [fps]
-                            frame_idx = [frame_idx]
+            timestamps = sources[0]["conversations"][0].get("timestamps", None)
+            if "tos_key" in sources[0]:
+                video_file = sources[0]["tos_key"]
+                video_bytes = sources[0].get("video_bytes", None)
+                if video_bytes is None:
+                    for _ in range(100):
+                        try:
+                            resp = self.cli.get_object(video_file)
+                            assert len(resp.data) == int(resp.headers["Content-Length"])
+                            video_bytes = resp.data
+                        except:
+                            continue
+                        break
+                if False:
+                    if len(video_file) > 1:
+                        video_file = [
+                            file for file in video_file
+                        ]
+                        results = [self.process_video_tos(file, ts) for file, ts in zip(video_file, timestamps)]
+                        video, video_grid_thw, second_per_grid_ts, fps, frame_idx = zip(*results)
                     else:
+                        video_file = video_file[0]
                         video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.process_video_tos(
                             video_file, timestamps
                         )
                         video = [video]
                         fps = [fps]
                         frame_idx = [frame_idx]
-                    if "use_audio" in sources[0] and sources[0]["use_audio"]:
-                        audio, audio_lengths = self.process_audio_tos(
-                            video_file, timestamps
-                        )
-                        if len(audio) > 1:
-                            audio = [torch.cat(audio, dim=0)]
-                            audio_lengths = [sum(audio_lengths)]
+                else:
+                    video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.process_video_tos(
+                        video_file, timestamps, video_bytes=video_bytes
+                    )
+                    video = [video]
+                    fps = [fps]
+                    frame_idx = [frame_idx]
+                if "use_audio" in sources[0] and sources[0]["use_audio"]:
+                    audio, audio_lengths = self.process_audio_tos(
+                        video_file, timestamps
+                    )
+                else:
+                    audio, audio_lengths = None, None
+            elif "video" in sources[0]:
+                video_file = sources[0]["video"]
+                video_bytes = sources[0].get("video_bytes", None)
+                if video_bytes is None:
+                    with open(video_file, "rb") as f:
+                        video_bytes = f.read()
+                if False:
+                    if len(video_file) > 1:
+                        video_file = [
+                            file for file in video_file
+                        ]
+                        results = [self.process_video(file, ts) for file, ts in zip(video_file, timestamps)]
+                        video, video_grid_thw, second_per_grid_ts, fps, frame_idx = zip(*results)
                     else:
-                        audio, audio_lengths = None, None
-                elif "video" in sources[0]:
-                    video_file = sources[0]["video"]
-                    if isinstance(video_file, List):
-                        if len(video_file) > 1:
-                            video_file = [
-                                file for file in video_file
-                            ]
-                            if timestamps is not None:
-                                results = [self.process_video(file, ts) for file, ts in zip(video_file, timestamps)]
-                            else:
-                                results = [self.process_video(file, video_max_frames=10000) for file in video_file]
-                            video, video_grid_thw, second_per_grid_ts, fps, frame_idx = zip(*results)
-                            video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.downsample(
-                                video, video_grid_thw, second_per_grid_ts, fps, frame_idx
-                            )
-                            video = [video]
-                            frame_idx = [frame_idx]
-                        else:
-                            video_file = video_file[0]
-                            video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.process_video(
-                                video_file, timestamps
-                            )
-                            video = [video]
-                            fps = [fps]
-                            frame_idx = [frame_idx]
-                    else:
+                        video_file = video_file[0]
                         video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.process_video(
                             video_file, timestamps
                         )
                         video = [video]
                         fps = [fps]
                         frame_idx = [frame_idx]
-                    if "use_audio" in sources[0] and sources[0]["use_audio"]:
-                        audio, audio_lengths = self.process_audio(
-                            video_file, timestamps
+                else:
+                    video, video_grid_thw, second_per_grid_ts, fps, frame_idx = self.process_video(
+                        video_file, timestamps, video_bytes=video_bytes
+                    )
+                    video = [video]
+                    fps = [fps]
+                    frame_idx = [frame_idx]
+                if "use_audio" in sources[0] and sources[0]["use_audio"]:
+                    audio, audio_lengths = self.process_audio(
+                        video_file, timestamps
+                    )
+                else:
+                    audio, audio_lengths = None, None
+            elif "videos" in sources[0]:
+                res = []
+                if "use_audio" in sources[0] and sources[0]["use_audio"]:
+                    audio = []
+                    audio_lengths = []
+                else:
+                    audio, audio_lengths = None, None
+                for video in sources[0]["videos"]:
+                    timestamps = video.get("timestamps", None)
+                    max_frame = video.get("max_frame", None)
+                    max_pixel = video.get("max_pixel", None)
+                    interval = video.get("interval", None)
+                    cached_video = video.get("pixel_values_videos", None)
+                    cached_video_grid_thw = video.get("video_grid_thw", None)
+                    cached_second_per_grid_ts = video.get("second_per_grid_ts", None)
+                    cached_fps = video.get("fps", None)
+                    cached_frame_idx = video.get("frame_idx", None)
+                    cached_audio = video.get("audio_feature", None)
+                    cached_audio_lengths = video.get("audio_lengths", None)
+                    if isinstance(cached_video_grid_thw, torch.Tensor) and cached_video_grid_thw.ndim == 2:
+                        if cached_video_grid_thw.shape[0] == 1:
+                            cached_video_grid_thw = cached_video_grid_thw[0]
+                    if isinstance(cached_video_grid_thw, (list, tuple)) and len(cached_video_grid_thw) == 1:
+                        cached_video_grid_thw = cached_video_grid_thw[0]
+                    if isinstance(cached_second_per_grid_ts, (list, tuple)) and len(cached_second_per_grid_ts) == 1:
+                        cached_second_per_grid_ts = cached_second_per_grid_ts[0]
+                    if isinstance(cached_fps, (list, tuple)) and len(cached_fps) == 1:
+                        cached_fps = cached_fps[0]
+                    if isinstance(cached_fps, torch.Tensor):
+                        cached_fps = cached_fps.item()
+                    if isinstance(cached_frame_idx, (list, tuple)) and len(cached_frame_idx) == 1:
+                        cached_frame_idx = cached_frame_idx[0]
+                    if isinstance(cached_second_per_grid_ts, (list, tuple)) and len(cached_second_per_grid_ts) == 1:
+                        cached_second_per_grid_ts = cached_second_per_grid_ts[0]
+                    if cached_video is not None and cached_video_grid_thw is not None:
+                        res.append(
+                            (
+                                cached_video,
+                                cached_video_grid_thw,
+                                cached_second_per_grid_ts,
+                                cached_fps,
+                                cached_frame_idx,
+                            )
                         )
-                        if len(audio) > 1:
-                            audio = [torch.cat(audio, dim=0)]
-                            audio_lengths = [sum(audio_lengths)]
-                    else:
-                        audio, audio_lengths = None, None
-                video_grid_thw_merged = copy.deepcopy(video_grid_thw)
-                if not isinstance(video_grid_thw, Sequence):
-                    video_grid_thw_merged = [video_grid_thw_merged]
-                    video_grid_thw = [video_grid_thw]
-                # video_grid_thw_merged = [
-                #     merged_thw.prod() // self.data_args.image_processor.merge_size**2
-                #     for merged_thw in video_grid_thw_merged
-                # ]
-            elif "audio" in sources[0]:
+                        if (
+                            "use_audio" in sources[0]
+                            and sources[0]["use_audio"]
+                            and cached_audio is not None
+                        ):
+                            audio.append(cached_audio)
+                            if cached_audio_lengths is not None:
+                                if isinstance(cached_audio_lengths, list):
+                                    audio_lengths += cached_audio_lengths
+                                else:
+                                    audio_lengths.append(cached_audio_lengths)
+                        continue
+                    if "video" in video:
+                        cur_bytes = video.get("video_bytes", None)
+                        if cur_bytes is None:
+                            with open(video["video"], "rb") as f:
+                                cur_bytes = f.read()
+                        res.append(self.process_video(video["video"], timestamps, max_frame, max_pixel, interval, video_bytes=cur_bytes))
+                        if "use_audio" in sources[0] and sources[0]["use_audio"]:
+                            cur_audio, cur_audio_lengths = self.process_audio(video["video"], timestamps)
+                            audio += cur_audio
+                            audio_lengths += cur_audio_lengths
+                    elif "tos_key" in video:
+                        cur_bytes = video.get("video_bytes", None)
+                        if cur_bytes is None:
+                            for _ in range(100):
+                                try:
+                                    resp = self.cli.get_object(video["tos_key"])
+                                    assert len(resp.data) == int(resp.headers["Content-Length"])
+                                    cur_bytes = resp.data
+                                except:
+                                    continue
+                                break
+                        res.append(self.process_video_tos(video["tos_key"], timestamps, max_frame, max_pixel, interval, video_bytes=cur_bytes))
+                        if "use_audio" in sources[0] and sources[0]["use_audio"]:
+                            cur_audio, cur_audio_lengths = self.process_audio_tos(video["tos_key"], timestamps)
+                            audio += cur_audio
+                            audio_lengths += cur_audio_lengths
+                video, video_grid_thw, second_per_grid_ts, fps, frame_idx = zip(*res)
+                # print(second_per_grid_ts)
+                # print(video_grid_thw, second_per_grid_ts, fps, frame_idx)
+            video_grid_thw_merged = copy.deepcopy(video_grid_thw)
+            if not isinstance(video_grid_thw, Sequence):
+                video_grid_thw_merged = [video_grid_thw_merged]
+                video_grid_thw = [video_grid_thw]
+            # video_grid_thw_merged = [
+            #     merged_thw.prod() // self.data_args.image_processor.merge_size**2
+            #     for merged_thw in video_grid_thw_merged
+            # ]
+            if "audio" in sources[0]:
                 audio_file = sources[0]["audio"]
                 audio, audio_lengths = self.process_audio(
                     audio_file
                 )
-            elif "tos_audio" in sources[0]:
+            if "tos_audio" in sources[0]:
                 audio_file = sources[0]["tos_audio"]
                 audio, audio_lengths = self.process_audio_tos(
                     audio_file
                 )
             chat_sources = copy.deepcopy([e["conversations"] for e in sources])
-            
-            plan_data_dict = None
-            if "plan" in self.data_args.planner_type and "video" in sources[0]:
-                plan_input = copy.deepcopy(sources[0])
-                ref_desc = plan_input["video_description"] if "video_description" in plan_input else ""
-                plan_input["conversations"] = [
-                    {
-                        "from": "human",
-                        "value": generate_plan_template.format(instruction=plan_input["instruction"])
-                    },
-                    {
-                        "from": "gpt",
-                        "value": ref_desc,
-                    }
-                ]
-                plan_data_dict = preprocess_qwen_3_visual(
-                    [plan_input["conversations"]],
-                    self.tokenizer,
-                    grid_thw_image=grid_thw_merged[:1] if grid_thw_merged else None,
-                    grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
-                    audio_lengths=audio_lengths if audio_lengths else None,
-                    merge_size=self.data_args.image_processor.merge_size,
-                    second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
-                    fps=fps if fps else None,
-                    frame_idx=frame_idx if frame_idx else None,
-                    total_timestamps=self.data_args.total_timestamps,
-                    n_full_res=self.data_args.n_full_res,
-                )
-                debug_input_ids = plan_data_dict["input_ids"]
-                audio_token_number = (debug_input_ids == 151669).sum()
-                assert audio_token_number % 60 == 0, f"Weird data: {sources}"
-            if "plan" in self.data_args.planner_type and "video" in sources[0] and not self.data_args.action_with_video:
-                chat_sources[0][0]["value"] = chat_sources[0][0]["value"].replace("<video>\n", "")
-                data_dict = preprocess_qwen_3_visual(
-                    chat_sources,
-                    self.tokenizer,
-                    grid_thw_image=grid_thw_merged if grid_thw_merged else None,
-                    grid_thw_video=None,
-                    audio_lengths=None,
-                    merge_size=self.data_args.image_processor.merge_size,
-                    second_per_grid_ts=None,
-                    fps=None,
-                    frame_idx=None,
-                    total_timestamps=self.data_args.total_timestamps,
-                    n_full_res=self.data_args.n_full_res,
-                )
-            else:
-                data_dict = preprocess_qwen_3_visual(
-                    chat_sources,
-                    self.tokenizer,
-                    grid_thw_image=grid_thw_merged if grid_thw_merged else None,
-                    grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
-                    audio_lengths=audio_lengths if audio_lengths else None,
-                    merge_size=self.data_args.image_processor.merge_size,
-                    second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
-                    fps=fps if fps else None,
-                    frame_idx=frame_idx if frame_idx else None,
-                    total_timestamps=self.data_args.total_timestamps,
-                    n_full_res=self.data_args.n_full_res,
-                )
-                debug_input_ids = data_dict["input_ids"]
-                audio_token_number = (debug_input_ids == 151669).sum()
-                assert audio_token_number % 60 == 0, f"Weird data: {sources}"
+            data_dict = preprocess_qwen_3_visual(
+                chat_sources,
+                self.tokenizer,
+                grid_thw_image=grid_thw_merged if grid_thw_merged else None,
+                grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
+                audio_lengths=audio_lengths if audio_lengths else None,
+                merge_size=self.data_args.image_processor.merge_size,
+                second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
+                fps=fps if fps else None,
+                frame_idx=frame_idx if frame_idx else None,
+                thinking_flags=[getattr(self.data_args, "thinking", None)
+                                if getattr(self.data_args, "thinking", None) is not None
+                                else source.get("thinking", False) for source in sources],
+                inference=self.inference or inference,
+            )
+            debug_input_ids = data_dict["input_ids"]
+            audio_token_number = (debug_input_ids == self.tokenizer.convert_tokens_to_ids("<|audio_pad|>")).sum()
+            assert audio_token_number % 60 == 0, f"Weird data: {sources}"
             position_ids = None
-            chosen_position_ids = None
-            reject_position_ids = None
-            if "images" not in sources[0] and "video" not in sources[0] and "tos_key" not in sources[0] and "audio" not in sources[0] and "tos_audio" not in sources[0]:
+            if "image" not in sources[0] and "video" not in sources[0] and "tos_key" not in sources[0] and "audio" not in sources[0] and "tos_audio" not in sources[0] and "videos" not in sources[0]:
                 grid_thw_merged = None
-                # sources = copy.deepcopy([e["conversations"] for e in sources])
-                # data_dict = preprocess_qwen_3_visual(
-                #     sources, self.tokenizer, None, None
-                # )
+                chat_sources = copy.deepcopy([e["conversations"] for e in sources])
+                data_dict = preprocess_qwen_3_visual(
+                    chat_sources, self.tokenizer, None, None,
+                    thinking_flags=[getattr(self.data_args, "thinking", None)
+                                if getattr(self.data_args, "thinking", None) is not None
+                                else source.get("thinking", False) for source in sources],
+                    inference=self.inference or inference,
+                )
                 position_ids = (
                     torch.arange(0, data_dict["input_ids"].size(1))
                     .view(1, -1)
@@ -1043,76 +1005,61 @@ class LazySupervisedDataset(Dataset):
                 )
 
             data_dict["position_ids"] = position_ids
-            data_dict["chosen_position_ids"] = chosen_position_ids
-            data_dict["reject_position_ids"] = reject_position_ids
             data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
-            if data_dict["chosen_ids"] is not None:
-                data_dict["chosen_attention_mask"] = [
-                    data_dict["chosen_ids"][0].size(0)
-                ]
-            if data_dict["reject_ids"] is not None:
-                data_dict["reject_attention_mask"] = [
-                    data_dict["reject_ids"][0].size(0)
-                ]
 
-            if "images" in sources[0]:
+            if "image" in sources[0]:
                 data_dict["pixel_values"] = torch.cat(image, dim=0)
                 data_dict["image_grid_thw"] = torch.cat(
                     [thw.unsqueeze(0) for thw in grid_thw], dim=0
                 )
             # video exist in the data
-            if "video" in sources[0] or "tos_key" in sources[0]:
+            if "video" in sources[0] or "tos_key" in sources[0] or "videos" in sources[0]:
                 data_dict["pixel_values_videos"] = torch.cat(video, dim=0)
                 data_dict["video_grid_thw"] = torch.cat(
                     [thw.unsqueeze(0) for thw in video_grid_thw], dim=0
                 )
+            # if "video" in sources[0]:
+            #     data_dict["video"] = sources[0]["video"]
+            # if "tos_key" in sources[0]:
+            #     data_dict["tos_key"] = sources[0]["video"]
+            # if "use_audio" in sources[0]:
+            #     data_dict["use_audio"] = sources[0]["use_audio"]
             if audio is not None:
                 audio = torch.cat(audio, dim=0)
             data_dict["audio_feature"] = audio
-            data_dict["audio_lengths"] = audio_lengths
-            if data_dict["chosen_ids"] is None and self.data_args.train_type != "grpo":
-                data_dict["train_type"] = "sft"
-            else:
-                data_dict["train_type"] = self.data_args.train_type
+            if second_per_grid_ts is not None:
+                data_dict["second_per_grid_ts"] = second_per_grid_ts
+            if fps is not None:
+                data_dict["fps"] = fps
+            if frame_idx is not None:
+                data_dict["frame_idx"] = frame_idx
+            if audio_lengths is not None:
+                data_dict["audio_lengths"] = audio_lengths
+            # data_dict["audio_lengths"] = audio_lengths
 
-            data_dict["prompt"] = sources[0]["conversations"][0]
-            data_dict["ref_answer"] = chat_sources[0][-1]["value"]
-            data_dict["negative"] = sources[0]["negative"] if "negative" in sources[0] else False
-            if self.data_args.run_test or self.validation or self.data_args.train_type == "grpo":
-                if "plan" in self.data_args.planner_type and plan_data_dict is not None:
-                    len_input = torch.where(plan_data_dict["input_ids"] == 151644)[1][-1] + 3
-                    data_dict["plan_input_ids"] = plan_data_dict["input_ids"][:, :len_input]
-                    if ref_desc != "":
-                        data_dict["plan_ref_ids"] = plan_data_dict["input_ids"]
-                        data_dict["plan_ref_preds"] = ref_desc
-                if self.data_args.run_test or self.validation:
-                    labels = data_dict.pop("labels", None)
-                if "plan" not in self.data_args.planner_type or self.data_args.run_test or self.validation:
-                    len_input = torch.where(data_dict["input_ids"] == 151644)[1][-1] + 3
-                    data_dict["input_ids"] = data_dict["input_ids"][:, :len_input]
-                # data_dict["position_ids"] = data_dict["position_ids"][:, :, :len_input]
+            # data_dict["prompt"] = sources[0]["conversations"][0]
+            # data_dict["ref"] = sources[0]["conversations"][1]["value"]
+            if self.inference or inference:
+                data_dict.pop("labels", None)
+                data_dict.pop("position_ids", None)
                 data_dict["attention_mask"] = torch.ones_like(data_dict["input_ids"])
 
-                if self.data_args.run_test or self.validation:
-                    data_dict["tos_key"] = sources[0].get("tos_key", None)
-                    data_dict["video"] = sources[0].get("video", None)
-                    data_dict["image"] = sources[0].get("image", None)
-                    data_dict["tos_audio"] = sources[0].get("tos_audio", None)
-                    data_dict["audio"] = sources[0].get("audio", None)
-                    data_dict["use_audio"] = sources[0].get("use_audio", False)
+            if no_meta:
+                data_dict.pop("timestamp", None)
+            else:
+                data_dict["attention_mask"] = torch.ones_like(data_dict["input_ids"])
+                data_dict["tos_key"] = sources[0].get("tos_key", None)
+                data_dict["video"] = sources[0].get("video", None)
+                data_dict["videos"] = sources[0].get("videos", None)
+                data_dict["video_bytes"] = video_bytes
+                data_dict["image"] = sources[0].get("image", None)
+                data_dict["tos_audio"] = sources[0].get("tos_audio", None)
+                data_dict["audio"] = sources[0].get("audio", None)
+                data_dict["use_audio"] = sources[0].get("use_audio", False)
+                data_dict["prompt"] = sources[0]["conversations"][0]
+                data_dict["ref"] = sources[0]["conversations"][1]["value"]
 
-                    # data_dict["prompt"] = sources[0]["conversations"][0]
-                    data_dict["ref"] = sources[0]["conversations"][-1]["value"]
-                    data_dict["images"] = sources[0]["images"] if "images" in sources[0] else None
-                    data_dict["task_id"] = sources[0]["task_id"] if "task_id" in sources[0] else None
-                    data_dict["should_use"] = sources[0].get("should_use", True)
-                    data_dict.pop("chosen_ids", None)
-                    data_dict.pop("reject_ids", None)
-                    data_dict.pop("chosen_position_ids", None)
-                    data_dict.pop("reject_position_ids", None)
-                    data_dict.pop("chosen_labels", None)
-                    data_dict.pop("reject_labels", None)
-                    data_dict.pop("audio_lengths", None)
+                data_dict["should_use"] = sources[0].get("should_use", True)
 
             return data_dict
         except Exception as e:
@@ -1144,15 +1091,24 @@ class DataCollatorForSupervisedDataset(object):
     def process_ids(self, input_ids, labels):
         input_ids = [ids.squeeze(0) for ids in input_ids]
         labels = [ids.squeeze(0) for ids in labels]
+        lengths = [min(ids.numel(), self.tokenizer.model_max_length) for ids in input_ids]
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         labels = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
-        # input_ids = input_ids[:, : self.tokenizer.model_max_length]
-        # labels = labels[:, : self.tokenizer.model_max_length]
-        attention_mask=input_ids.ne(self.tokenizer.pad_token_id)
+        input_ids = input_ids[:, : self.tokenizer.model_max_length]
+        labels = labels[:, : self.tokenizer.model_max_length]
+        padded_length = min(
+            self.tokenizer.model_max_length,
+            math.ceil(input_ids.shape[1] / 128) * 128,
+        )
+        pad = padded_length - input_ids.shape[1]
+        if pad:
+            input_ids = torch.nn.functional.pad(input_ids, (0, pad), value=self.tokenizer.pad_token_id)
+            labels = torch.nn.functional.pad(labels, (0, pad), value=IGNORE_INDEX)
+        attention_mask = torch.arange(input_ids.shape[1])[None, :] < torch.tensor(lengths)[:, None]
         return input_ids, labels, attention_mask
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
@@ -1165,69 +1121,12 @@ class DataCollatorForSupervisedDataset(object):
         input_ids, labels, attention_mask = self.process_ids(
             input_ids, labels
         )
-        if "distill_input_ids" in instances[0]:
-            distill_input_ids, distill_labels, distill_position_ids = tuple(
-                [instance[key] for instance in instances]
-                for key in ("distill_input_ids", "distill_labels", "distill_position_ids")
-            )
-            distill_input_ids, distill_labels, distill_attention_mask = self.process_ids(
-                distill_input_ids, distill_labels
-            )
-        # gs534 - prompt and ref_answer for generation
-        prompts = [instance["prompt"] for instance in instances]
-        ref_answer = [instance["ref_answer"] for instance in instances]
-        negative_video = [instance["negative"] for instance in instances]
-        plan_input_ids = None
-        plan_ref_ids = None
-        plan_ref_preds = None
-        if "plan_input_ids" in instances[0]:
-            plan_input_ids = torch.cat([instance["plan_input_ids"] for instance in instances], dim=0)
-            if "plan_ref_ids" in instances[0]:
-                plan_ref_ids = torch.cat([instance["plan_ref_ids"] for instance in instances], dim=0)
-                plan_ref_preds = [instance["plan_ref_preds"] for instance in instances]
-        if "chosen_ids" in instances[0]:
-            chosen_ids, chosen_labels, chosen_position_ids = tuple(
-                [instance[key] for instance in instances]
-                for key in ("chosen_ids", "chosen_labels", "chosen_position_ids")
-            )
-            if chosen_ids[0] is not None:
-                chosen_ids, chosen_labels, chosen_attention_mask = self.process_ids(
-                    chosen_ids, chosen_labels
-                )
-            else:
-                chosen_ids, chosen_labels, chosen_attention_mask = None, None, None
-            reject_ids, reject_labels, reject_position_ids = tuple(
-                [instance[key] for instance in instances]
-                for key in ("reject_ids", "reject_labels", "reject_position_ids")
-            )
-            if reject_ids[0] is not None:
-                reject_ids, reject_labels, reject_attention_mask = self.process_ids(
-                    reject_ids, reject_labels
-                )
-            else:
-                reject_ids, reject_labels, reject_attention_mask = None, None, None
-        else:
-            chosen_ids, chosen_labels, chosen_attention_mask = None, None, None
-            reject_ids, reject_labels, reject_attention_mask = None, None, None
-        train_type = [instance["train_type"] for instance in instances][0]
         batch = dict(
             input_ids=input_ids,
             labels=labels,
-            chosen_ids=chosen_ids,
-            chosen_labels=chosen_labels,
-            reject_ids=reject_ids,
-            reject_labels=reject_labels,
             attention_mask=attention_mask,
-            chosen_attention_mask=chosen_attention_mask,
-            reject_attention_mask=reject_attention_mask,
-            train_type=train_type,
-            prompts=prompts,
-            ref_answer=ref_answer,
-            negative_video=negative_video,
-            plan_input_ids=plan_input_ids,
-            plan_ref_ids=plan_ref_ids,
-            plan_ref_preds=plan_ref_preds,
         )
+        batch["mm_token_type_ids"] = multimodal_token_type_ids(input_ids, self.tokenizer)
         images = list(
             instance["pixel_values"]
             for instance in instances
@@ -1242,11 +1141,6 @@ class DataCollatorForSupervisedDataset(object):
             instance["audio_feature"]
             for instance in instances
             if instance["audio_feature"] is not None
-        )
-        distill_videos = list(
-            instance["distill_pixel_values_videos"]
-            for instance in instances
-            if "distill_pixel_values_videos" in instance
         )
         if len(images) != 0:
             concat_images = torch.cat([image for image in images], dim=0)
@@ -1284,30 +1178,11 @@ class DataCollatorForSupervisedDataset(object):
             concat_audios = None
             audio_lengths = None
 
-        if len(distill_videos) != 0:
-            concat_distill_videos = torch.cat([video for video in distill_videos], dim=0)
-            distill_video_grid_thw = [
-                instance["distill_video_grid_thw"]
-                for instance in instances
-                if "distill_video_grid_thw" in instance
-            ]
-            distill_video_grid_thw = torch.cat(distill_video_grid_thw, dim=0)
-        else:
-            concat_distill_videos = None
-            distill_video_grid_thw = None
-
         batch["pixel_values"] = concat_images
         batch["image_grid_thw"] = grid_thw
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["audio_feature"] = concat_audios
-        batch["audio_lengths"] = audio_lengths
-        if "distill_pixel_values_videos" in instances[0]:
-            batch["distill_pixel_values_videos"] = concat_distill_videos
-            batch["distill_video_grid_thw"] = distill_video_grid_thw
-            batch["distill_input_ids"] = distill_input_ids
-            batch["distill_labels"] = distill_labels
-            batch["distill_attention_mask"] = distill_attention_mask
         return batch
 
 
@@ -1390,13 +1265,9 @@ def make_supervised_data_module(
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args)
-    if data_args.validation_data != "":
-        eval_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args, validation=True)
-    else:
-        eval_dataset = None
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(
-        train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator
+        train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
     )
 
 

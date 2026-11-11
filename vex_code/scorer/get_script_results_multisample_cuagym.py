@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import argparse
 from collections import defaultdict
@@ -81,8 +82,8 @@ def discover_tasks_from_results(results_dir):
             if not os.path.isdir(entry_path):
                 continue
 
-            if "_sample_" in entry:
-                base_task_id = entry.rsplit("_sample_", 1)[0]
+            if "_sample" in entry:
+                base_task_id = entry.rsplit("_sample", 1)[0]
             elif "_audio_" in entry:
                 base_task_id = entry.rsplit("_audio_", 1)[0]
             else:
@@ -119,7 +120,6 @@ def is_done(traj_path):
     与第二个脚本一致：检查 traj.jsonl 最后一条 action 是否包含 terminate。
     同时兼容旧格式中的 DONE。
     """
-    # return True
     try:
         with open(traj_path, "r") as f:
             lines = f.readlines()
@@ -147,23 +147,63 @@ def is_done(traj_path):
 
 def build_task_dir_candidates(task_id, sample_idx):
     """
-    兼容两种目录命名：
-    - task_id / task_id_sample_N
-    - task_id_audio_N
+    兼容新 harness 的 task_id_sample0/1/2，以及旧版无后缀 sample0。
+    同时保留 task_id_audio_N 和 task_id_video_N 命名。
 
     这里把 sample_indices 视为 0-based rollout 序号：
-    - 0 -> task_id 或 task_id_audio_1
-    - 1 -> task_id_sample_1 或 task_id_audio_2
+    - 0 -> task_id_sample0、task_id 或 task_id_audio_1/video_1
+    - 1 -> task_id_sample1 或 task_id_audio_2/video_2
     """
     normalized_task_id = task_id.replace("_verified", "")
-    candidates = []
+    candidates = [f"{normalized_task_id}_sample{sample_idx}"]
     if sample_idx == 0:
         candidates.append(normalized_task_id)
-    else:
-        candidates.append(f"{normalized_task_id}_sample_{sample_idx}")
     candidates.append(f"{normalized_task_id}_audio_{sample_idx + 1}")
     candidates.append(f"{normalized_task_id}_video_{sample_idx + 1}")
     return list(dict.fromkeys(candidates))
+
+
+def discover_sample_indices(results_dir):
+    """从 results_dir 自动扫描所有已有 sample 下标。"""
+    sample_indices = set()
+
+    if not os.path.isdir(results_dir):
+        return [0]
+
+    for category in os.listdir(results_dir):
+        category_dir = os.path.join(results_dir, category)
+        if not os.path.isdir(category_dir):
+            continue
+
+        for entry in os.listdir(category_dir):
+            entry_path = os.path.join(category_dir, entry)
+            if not os.path.isdir(entry_path):
+                continue
+
+            matched = False
+            for pattern, offset in ((r"_sample(\d+)$", 0), (r"_audio_(\d+)$", -1), (r"_video_(\d+)$", -1)):
+                match = re.search(pattern, entry)
+                if match:
+                    sample_indices.add(max(0, int(match.group(1)) + offset))
+                    matched = True
+                    break
+
+            if not matched:
+                sample_indices.add(0)
+
+    return sorted(sample_indices) if sample_indices else [0]
+
+
+def resolve_sample_indices(sample_indices_arg, results_dir):
+    if len(sample_indices_arg) == 1 and sample_indices_arg[0].lower() == "auto":
+        sample_indices = discover_sample_indices(results_dir)
+        print(f"Auto-discovered sample indices: {sample_indices}")
+        return sample_indices
+
+    if any(item.lower() == "auto" for item in sample_indices_arg):
+        raise ValueError("--sample_indices 要么传 auto，要么传一组整数下标，不能混用。")
+
+    return sorted(set(int(item) for item in sample_indices_arg))
 
 
 def calculate_topk_mean(results_dir, tasks_by_cat, sample_indices):
@@ -553,21 +593,21 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default="OSWorld-self-evolve/results/vs2_agentnet_osworld_trainproj_8samples",
+        default='data/vs2_agentnet_osworld_trainproj_8samples',
         help="结果目录。",
     )
     parser.add_argument(
         "--task_file",
         type=str,
-        default="OSWorld-self-evolve/cuagym_data/cuagym_selected_220.json",
+        default='data/cuagym_220_cherrypick.json',
         help="任务列表 JSON；设为 auto 时从 results_dir 自动发现任务。",
     )
     parser.add_argument(
         "--sample_indices",
-        type=int,
+        type=str,
         nargs="+",
-        default=[0, 1, 2],
-        help="要取平均的 rollout 下标，默认前 3 个：[0, 1, 2]；兼容 task_sample_N 与 task_audio_N。",
+        default=["0", "1", "2"],
+        help="要取平均的 rollout 下标，默认前 3 个：[0, 1, 2]；兼容 task_sample_N 与 task_audio_N。传 auto 时自动扫描 results_dir 中所有 sample 下标。",
     )
     # parser.add_argument(
     #     "--allow_partial",
@@ -577,7 +617,12 @@ def main():
 
     args = parser.parse_args()
 
-    sample_indices = sorted(set(args.sample_indices))
+    try:
+        sample_indices = resolve_sample_indices(args.sample_indices, args.results_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
+
     tasks_by_cat = load_tasks(args.task_file, args.results_dir)
     if not tasks_by_cat:
         return

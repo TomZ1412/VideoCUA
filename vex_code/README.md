@@ -1,100 +1,59 @@
-# VEX Code
+# Running the Qwen3.5 VEX code
 
-This directory contains the training, agent evaluation, trajectory verification, and result
-selection code for video-SALMONN-VEX. For installation, data and checkpoint preparation, AGGO
-training, and benchmark launch commands, see the [project README](../README.md).
+## Training
 
-## Code map
+See [vsvex_train/README.md](vsvex_train/README.md). The three stage launchers use
+MODEL_PATH, MODEL_BASE, TRAIN_DATA, VALIDATION_DATA and LORA_CKPT. AGGO additionally
+uses LORA_CKPT_2. Data examples are under ../example/. Weights will be published later.
+The existing Qwen3.5 trainer selects dual-LoRA AGGO with train_type=cua_grpo.
 
-| Component | Location | Purpose |
-| --- | --- | --- |
-| AGGO training | `vsvex_train/cua_multirl_dualora/` | Dual-LoRA training with action-likelihood rewards |
-| Public launchers | `scripts/` | AGGO training and OSWorld/CUA-Gym evaluation entry points |
-| video-SALMONN-VEX agent | `vsvex_inference/models/`, `vsvex_inference/tests/test_vss_local*.py` | Model loading and benchmark execution |
-| Gemini agent | `vsvex_inference/mm_agents/gemini/`, `vsvex_inference/tests/test_gemini_local*.py` | Gemini-based benchmark execution |
-| Verification | `vsvex_inference/verification/` | Convert trajectories to narrated videos and score them |
-| video-SALMONN verifier | `vsvex_verifier/` | Score narrated trajectories from 0 to 9 |
-| Result selection | `scorer/` | Aggregate repeated trials and apply VEX selection policies |
+## Guidance
 
-## Verification pipeline
+The existing vsvex_train/qwen35_cua_multirl_dualora/test.sh decodes guidance with
+CHECKPOINT/adapter_2. Use its scripts/README_test.md and the input schema in
+../example/guidance_osworld.json. Convert combined
+predictions with vsvex_inference/guidance/get_video_desc.py after configuring its
+mapping and input/output paths. For silent-video guidance set use_audio=false.
 
-Run the commands in this section from `vsvex_inference/`.
+## Benchmarks
 
-### 1. Collect trajectories
-
-Convert evaluation result folders into a trajectory manifest:
+Install compatible OSWorld/CUA-Gym environments and task bundles separately.
+Place/link the OSWorld checkout at vsvex_inference/OSWorld/ as expected by the
+existing runners. Run the following from vsvex_inference/:
 
 ```bash
-python verification/get_gpt_data.py \
-    --whitelist /path/to/task_manifest.json \
-    --basepath /path/to/results/RUN_ID \
-    --examples-root /path/to/OSWorld/evaluation_examples/examples \
-    --output /path/to/workspace/trajectories.json \
-    --model vs2 \
-    --nsample 1
+bash ../scripts/eval_qwen35_harness_local.sh
+# or
+bash ../scripts/eval_qwen35_harness_local_cuagym.sh
 ```
 
-Increase `--nsample` when multiple executions are available for each task.
+Required environment variables: RUN_ID, TASK_CONFIG_DIR, MODEL_PATH,
+VEX_PROCESSOR_BASE, VOLCENGINE_SUBNET_ID, VOLCENGINE_ZONE_ID, VOLCENGINE_IMAGE_ID,
+VOLCENGINE_ACCESS_KEY_ID and VOLCENGINE_SECRET_ACCESS_KEY. Configure the remaining
+provider-required variables and VM password/proxy settings for your environment.
+LORA_CKPT defaults to No; GUIDE_TRAJ and ORACLE_TRAJ default to none. Use compatible
+action adapter_1 and extracted guides for tutorial-conditioned evaluation.
+For text guidance without raw tutorial context, set USE_VIDEO=false in OSWorld.
 
-### 2. Build narrated videos
+Optional settings: NUM_GPUS=8, TASKS_PER_GPU=3, MAX_STEPS=50, N_HISTORY=5,
+NSAMPLES=1, MAX_TOKENS=4096, RESULT_DIR=results. Change these to your compute budget.
+The launchers contain no personal paths or cloud resource identifiers.
 
-1. Configure `traj_file` and `traj_output` in `verification/get_audio.py`, create the target audio
-   directory, and run the script to synthesize each action description with Kokoro TTS.
-2. Configure the input manifest and output video paths in `verification/make_video.py`, then run it
-   to combine screenshots and audio with FFmpeg.
+## Verification and selection
 
-These two scripts currently use source-level path constants. They require Kokoro TTS, `ffmpeg`, and
-`ffprobe`.
+See [vsvex_inference/verification/README.md](vsvex_inference/verification/README.md)
+for collecting trajectories, Kokoro narration and ffmpeg rendering. Configure
+YOUR_XXX_PATH placeholders or the provided environment/CLI options.
 
-### 3. Build verifier input
+[vsvex_verifier/README.md](vsvex_verifier/README.md) documents run_verifier.sh:
+MODEL_PATH, MODEL_BASE and VERIFIER_DATA are required, LORA_CKPT is optional.
+Set NO_AUDIO=true when using native Qwen3.5 base on video inputs.
 
-`verification/gather_data.py` converts the video manifest into the JSON format consumed by the
-video-SALMONN verifier. Each item contains the trajectory video, task instruction, task ID,
-model/source metadata, and verification prompt. Its input files and video root are currently
-configured as source-level constants and must be changed for a new run.
+Configure scorer/filter_tasks_video_ordered_grouped_fixed.py with
+VEX_VERIFIER_RESULT, VEX_BACKUP_RESULT, VEX_PADDING_RESULT, VEX_TESTFILE and
+VEX_DESCRIPTION_FILE; VEX_THRESHOLD=7 and VEX_MAX_TRIAL=3 are the default policy.
+It orders and selects existing rollouts; it does not launch new environment trials.
 
-### 4. Score trajectories
-
-For the video-SALMONN verifier, run:
-
-```bash
-bash ../vsvex_verifier/run_verifier.sh \
-    --interval 1 \
-    --run_name "${VERIFIER_RUN_NAME}" \
-    --dataset "${VERIFIER_DATASET}" \
-    --max_frames 768 \
-    --model "${VERIFIER_MODEL}" \
-    --model_base "${MODEL_BASE_PATH}" \
-    --model_type dense \
-    --total_timestamps 256 \
-    --max_pixels 128000 \
-    --lora_ckpt "${VSS_SFT_CHECKPOINT}" \
-    --expectation
-```
-
-See [`vsvex_verifier/README.md`](vsvex_verifier/README.md) for launcher details. The verifier code is
-included, while its model and LoRA checkpoints have not been released yet.
-
-Alternatively, configure the endpoint, model, input JSON, and output JSON placeholders in
-`verification/gemini_verifier.py`, then run:
-
-```bash
-python verification/gemini_verifier.py
-```
-
-Provide credentials outside version control. The output adds a `verification` score to each item.
-
-### 5. Select the final trajectory
-
-The released scripts in `scorer/` support aggregation across repeated samples and videos.
-`scorer/filter_tasks_video_ordered_grouped.py` implements the current grouped ordered policy:
-
-- begin with a no-video execution;
-- stop when its score reaches `threshold`;
-- otherwise retry with video guidance until `max_trial` is reached; and
-- if no trial reaches the threshold, retain the highest-scoring execution.
-
-The scorer currently uses source-level paths and policy constants. Update them before running on a
-new result directory. The legacy standalone `filter_tasks_video.py` and
-`filter_tasks_video_ordered.py` scripts referenced in the original workflow are not included; use
-the released aggregation scripts and grouped ordered implementation instead.
+The model packages should run in separate processes/environments so their qwenvl
+module names do not conflict. This release does not automatically download weights
+or provision benchmark environments.

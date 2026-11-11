@@ -26,15 +26,13 @@ Carefully analyze the video, then directly provide your final scores in the foll
 """
 
 
-# with open("traj_data_video_qwen35.json") as fin:
 #     data = json.load(fin)
 data = []
-workspace_root = os.environ.get("VEX_WORKSPACE_ROOT", "workspace")
 
-with open("traj_data_video_vs2_desc.json") as fin:
+with open('YOUR_VIDEO_TRAJECTORIES_PATH') as fin:
     data_vs2 = json.load(fin)
 
-with open("traj_data_qwen35.json") as fin:
+with open('YOUR_REFERENCE_TRAJECTORIES_PATH') as fin:
     labels = json.load(fin)
 
 task_to_label = {}
@@ -43,7 +41,7 @@ for datapiece in labels:
 
 video_eval_data = []
 for datapiece in data:
-    videopath = os.path.join(workspace_root, datapiece["video"])
+    videopath = os.path.join('YOUR_VIDEO_ROOT_PATH', datapiece["video"])
     if not os.path.exists(videopath):
         import pdb; pdb.set_trace()
     newpiece = {
@@ -66,7 +64,9 @@ for datapiece in data:
     video_eval_data.append(newpiece)
 
 for datapiece in data_vs2:
-    videopath = os.path.join(workspace_root, datapiece["video"])
+    if "video" not in datapiece:
+        continue
+    videopath = os.path.join('YOUR_VIDEO_ROOT_PATH', datapiece["video"])
     if not os.path.exists(videopath):
         import pdb; pdb.set_trace()
     newpiece = {
@@ -87,6 +87,5 @@ for datapiece in data_vs2:
         "instruction": datapiece["instruction"]
     }
     video_eval_data.append(newpiece)
-
-with open("video_eval_data_vs2_desc.json", "w") as fout:
+with open('YOUR_VERIFIER_INPUT_PATH', "w") as fout:
     json.dump(video_eval_data, fout, indent=4)

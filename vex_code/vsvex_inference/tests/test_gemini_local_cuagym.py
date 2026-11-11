@@ -6,12 +6,9 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import argparse
-try:
-    import bytedlogger
-except ImportError:
-    bytedlogger = None
-else:
-    bytedlogger.config_default()
+import bytedlogger
+
+bytedlogger.config_default()
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +17,7 @@ from cua_gym import load_cua_gym_task, register_cua_gym_evaluators
 
 logger = logging.getLogger(__name__)
 
-CUA_GYM_TASK_ROOT = Path("CUA/data/cua_gym_tasks")
+CUA_GYM_TASK_ROOT = Path('data/cua_gym_tasks')
 
 
 def str2bool(v):
@@ -121,7 +118,7 @@ def resolve_examples_for_task(
             )
         else:
             video_path = os.path.join(
-                "OSWorld-self-evolve/data/videos/",
+                'data/videos',
                 f"{single_task_config['id']}.mp4",
             )
 
@@ -174,17 +171,19 @@ def run_single_example(
         examples=examples,
         history_n=args.max_history,
         temperature=args.temperature,
-        api_key=os.environ.get("GEMINI_API_KEY"),
-        base_url="base_url",
+        api_key=__import__("os").environ.get("OPENAI_API_KEY", ""),
+        base_url="https://example.com/v1",
     )
     agent.reset(logger)
 
+    print(os.environ.get("PROXY_CONFIG_FILE"))
+    print(os.environ.get("VOLCENGINE_IMAGE_ID"))
     image_id = ""
     env = DesktopEnv(
         path_to_vm=None,
         action_space="pyautogui",
-        provider_name="",
-        region="",
+        provider_name="volcengine",
+        region="ap-southeast-3",
         snapshot_name=image_id,
         screen_size=(1920, 1080),
         headless=True,
@@ -192,7 +191,7 @@ def run_single_example(
         cache_dir=args.cache_dir,
         require_a11y_tree=False,
         enable_proxy=True,
-        client_password="",
+        client_password=os.environ.get("OSWORLD_VM_PASSWORD", ""),
     )
     obs = env.reset(task_config)
     obs = env._get_obs()

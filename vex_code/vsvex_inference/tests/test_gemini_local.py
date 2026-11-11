@@ -1,17 +1,13 @@
 import sys
 import json
 import os
+import shutil
 import logging
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import argparse
-try:
-    import bytedlogger
-except ImportError:
-    bytedlogger = None
-else:
-    bytedlogger.config_default()
+logging.basicConfig(level=logging.INFO)
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -41,6 +37,13 @@ def run_single_example(
 
     print("task_config", task_config)
     result_dir = result_dir / task_config["id"]
+    result_file = result_dir / "result.txt"
+    if result_file.exists():
+        logger.info("Task id=%s skipped: existing result found at %s", task_config["id"], result_file)
+        return
+    if result_dir.exists():
+        logger.info("Task id=%s has stale outputs without result.txt, removing %s", task_config["id"], result_dir)
+        shutil.rmtree(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
 
     instruction = task_config["instruction"]
@@ -51,16 +54,22 @@ def run_single_example(
         examples = examples,
         history_n = args.max_history,
         temperature = args.temperature,
-        api_key=os.environ.get("GEMINI_API_KEY"),
-        base_url = "",
+        api_key = __import__("os").environ.get("OPENAI_API_KEY", ""),
+        # base_url = "https://example.com/v1",
+        base_url = "https://example.com/v1",
     )
     agent.reset(logger)
+    # os.environ.get("VOLCENGINE_IMAGE_ID", "YOUR_IMAGE_ID")
+    # image_id = "YOUR_IMAGE_ID"
+    # print("Image ID", image_id)
+    print(os.environ["PROXY_CONFIG_FILE"])
+    print(os.environ['VOLCENGINE_IMAGE_ID'])
     image_id = ""
     env = DesktopEnv(
         path_to_vm=None,
         action_space="pyautogui",
-        provider_name="",
-        region="",
+        provider_name="volcengine", 
+        region="ap-southeast-3",
         snapshot_name=image_id,
         screen_size=(1920, 1080),
         headless=True,
@@ -68,7 +77,7 @@ def run_single_example(
         cache_dir=args.cache_dir,
         require_a11y_tree=False,
         enable_proxy=True,
-        client_password="",
+        client_password=os.environ.get("OSWORLD_VM_PASSWORD", ""),
     )
     obs = env.reset(task_config)
     obs = env._get_obs() # Get the initial obs
@@ -281,7 +290,7 @@ if __name__ == "__main__":
                             video_path = task_to_video[task_id] if task_id in task_to_video else None
                             single_task_config["id"] = task_id.replace("_verified", "")
                         else:
-                            video_path = os.path.join("OSWorld-self-evolve/data/videos/", single_task_config["id"]+".mp4")
+                            video_path = os.path.join('data/videos', single_task_config["id"]+".mp4")
                         if oracle_traj is not None and video_path in oracle_traj:
                             task_config_to_traj[single_task_config["id"]] = oracle_traj[video_path]
                         elif oracle_traj is None and video_path is not None and os.path.exists(video_path):
@@ -336,7 +345,7 @@ if __name__ == "__main__":
                         video_path = task_to_video[task_id] if task_id in task_to_video else None
                         single_task_config["id"] = task_id.replace("_verified", "")
                     else:
-                        video_path = os.path.join("OSWorld-self-evolve/data/videos/", single_task_config["id"]+".mp4")
+                        video_path = os.path.join('data/videos', single_task_config["id"]+".mp4")
                     if oracle_traj is not None and video_path in oracle_traj:
                         task_config_to_traj[single_task_config["id"]] = oracle_traj[video_path]
                     elif oracle_traj is None and video_path is not None and os.path.exists(video_path):

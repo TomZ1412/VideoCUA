@@ -1,26 +1,385 @@
+import json
 import logging
+import os
+import sys
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-import sys, os
 
 from .actions import parse_base_response, py_string
 from .client import call_gemini
 from .history import (
     build_messages,
     dump_debug_messages,
+    ensure_empty_think_prefix,
     previous_actions_text,
     update_folding_state,
 )
-from .images import image_size_from_base64, image_size_from_bytes, process_image, process_image_resize
 from .images import create_video_clip, encode_video_base64
-from .prompts import (
-    build_base_system_prompt,
-    build_base_tools_def,
-    build_instruction_prompt,
-)
+from .images import image_size_from_base64, image_size_from_bytes, process_image, process_image_resize
+from .images import adjust_coordinates
+from .parser import extract_action_line, iter_tool_call_params, parse_coordinate, parse_keys, parse_number
+from .prompts import build_base_system_prompt, build_base_tools_def, build_instruction_prompt
 from .scaffolds import get_gemini_scaffold_profile
 
 
 logger = None
+
+SEARCH_ACTION_DESCRIPTION_PROMPT = """
+* `key`: Performs key down presses on the arguments passed in order, then performs key releases in reverse order.
+* `key_down`: Press and hold a single key without releasing it.
+* `key_up`: Release a previously held single key.
+* `left_mouse_down`: Press and hold the left mouse button.
+* `left_mouse_up`: Release the left mouse button.
+* `type`: Type a string of text on the keyboard.
+* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.
+* `left_click`: Click the left mouse button.
+* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.
+* `right_click`: Click the right mouse button.
+* `middle_click`: Click the middle mouse button.
+* `double_click`: Double-click the left mouse button.
+* `triple_click`: Triple-click the left mouse button.
+* `scroll`: Performs a scroll of the mouse scroll wheel.
+* `hscroll`: Performs a horizontal scroll.
+* `screenshot`: Capture a new screenshot of the current screen.
+* `wait`: Wait specified seconds for the change to happen.
+* `save_knowledge`: Save a task-relevant knowledge item grounded in the currently visible page or screenshot.
+* `stop_search`: Stop the search. Use `status=success` only when enough knowledge has already been saved. Use `status=failure` when evidence is insufficient or the search is stuck.
+""".strip()
+
+SCROLL_PIXELS_PER_CLICK = 120.0
+SCROLL_MAX_CLICKS = 8
+SEARCH_ACTION_ENUM = {
+    "key",
+    "key_down",
+    "key_up",
+    "left_mouse_down",
+    "left_mouse_up",
+    "type",
+    "mouse_move",
+    "left_click",
+    "left_click_drag",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "scroll",
+    "hscroll",
+    "screenshot",
+    "wait",
+    "save_knowledge",
+    "stop_search",
+}
+SEARCH_ACTION_ALIASES = {
+    "click": "left_click",
+    "leftclick": "left_click",
+    "doubleclick": "double_click",
+    "tripleclick": "triple_click",
+    "rightclick": "right_click",
+    "middleclick": "middle_click",
+    "mousemove": "mouse_move",
+    "move_mouse": "mouse_move",
+    "drag": "left_click_drag",
+    "drag_to": "left_click_drag",
+    "leftdrag": "left_click_drag",
+    "leftclickdrag": "left_click_drag",
+    "keydown": "key_down",
+    "keyup": "key_up",
+    "mousedown": "left_mouse_down",
+    "mouseup": "left_mouse_up",
+    "leftmousedown": "left_mouse_down",
+    "leftmouseup": "left_mouse_up",
+    "saveknowledge": "save_knowledge",
+    "save_knowledge_item": "save_knowledge",
+    "stopsearch": "stop_search",
+    "stop_search_success": "stop_search",
+    "stop_search_failure": "stop_search",
+}
+
+
+def _pixels_to_clicks(pixels: int) -> int:
+    if pixels == 0:
+        return 0
+    magnitude = min(
+        SCROLL_MAX_CLICKS,
+        max(1, int(abs(pixels) / SCROLL_PIXELS_PER_CLICK + 0.5)),
+    )
+    return magnitude if pixels > 0 else -magnitude
+
+
+def _normalize_search_action(raw_action: object) -> str:
+    action = str(raw_action or "").strip()
+    action = action.strip("`'\" \t\r\n")
+    action = action.lower().replace("-", "_").replace(" ", "_")
+    action = SEARCH_ACTION_ALIASES.get(action, action)
+    return action if action in SEARCH_ACTION_ENUM else ""
+
+
+def build_search_tools_def(processed_width: int, processed_height: int, coordinate_type: str) -> Dict:
+    resolution = (
+        f"* The screen's resolution is {processed_width}x{processed_height}."
+        if coordinate_type == "absolute"
+        else "* The screen's resolution is 1000x1000."
+    )
+    description = "\n".join(
+        [
+            "Use a mouse and keyboard to interact with a computer, and save structured knowledge items while searching.",
+            "* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.",
+            "* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions.",
+            resolution,
+            "* Save knowledge only when it is grounded in currently visible content from the screenshot or page you have opened.",
+            "* If you are not yet ready to stop, keep browsing after saving knowledge.",
+        ]
+    )
+    return {
+        "type": "function",
+        "function": {
+            "name": "computer_use",
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": SEARCH_ACTION_DESCRIPTION_PROMPT,
+                        "enum": [
+                            "key",
+                            "key_down",
+                            "key_up",
+                            "left_mouse_down",
+                            "left_mouse_up",
+                            "type",
+                            "mouse_move",
+                            "left_click",
+                            "left_click_drag",
+                            "right_click",
+                            "middle_click",
+                            "double_click",
+                            "triple_click",
+                            "scroll",
+                            "hscroll",
+                            "screenshot",
+                            "wait",
+                            "save_knowledge",
+                            "stop_search",
+                        ],
+                    },
+                    "keys": {"type": "array", "description": "Required only by `action=key`, `action=key_down`, or `action=key_up`."},
+                    "text": {"type": "string", "description": "Required only by `action=type`."},
+                    "coordinate": {
+                        "type": "array",
+                        "description": "(x, y) coordinates. Required only by `action=mouse_move` and `action=left_click_drag`, optional for `action=left_mouse_down` and `action=left_mouse_up`.",
+                    },
+                    "pixels": {"type": "number", "description": "Scroll amount. Required only by `action=scroll` or `action=hscroll`."},
+                    "time": {"type": "number", "description": "Seconds to wait. Required only by `action=wait`."},
+                    "summary": {"type": "string", "description": "Required by `action=save_knowledge`. One concise factual statement."},
+                    "steps": {"type": "array", "description": "Optional by `action=save_knowledge`. Concrete actionable steps grounded in what is visible now."},
+                    "source": {"type": "string", "description": "Optional by `action=save_knowledge`. The current page URL, site, or title."},
+                    "evidence": {"type": "string", "description": "Required by `action=save_knowledge`. A short quote or visible UI labels from the current screenshot/page."},
+                    "task_relevance": {"type": "string", "description": "Optional by `action=save_knowledge`. Which part of the original task this helps with."},
+                    "uncertainty": {"type": "string", "description": "Optional by `action=save_knowledge`. Specific remaining uncertainty or `none`."},
+                    "confidence": {
+                        "type": "string",
+                        "description": "Optional by `action=save_knowledge`. Confidence in this knowledge item.",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "reason": {"type": "string", "description": "Optional by `action=stop_search`. Short reason for stopping."},
+                    "status": {
+                        "type": "string",
+                        "description": "Required only by `action=stop_search`.",
+                        "enum": ["success", "failure"],
+                    },
+                },
+            },
+        },
+    }
+
+
+def build_search_system_prompt(tools_def: Dict, collapse_text: str) -> str:
+    return (
+        "You are a browser-search agent that can both browse and save structured knowledge.\n\n"
+        "# Tools\n\n"
+        "You have access to the following function:\n\n"
+        "<tools>\n"
+        + json.dumps(tools_def, ensure_ascii=False)
+        + "\n</tools>\n\n"
+        "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+        "<tool_call>\n"
+        "<function=computer_use>\n"
+        "<parameter=action>\n"
+        "one_allowed_action_name\n"
+        "</parameter>\n"
+        "<parameter=action_parameter_1>\n"
+        "value\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n\n"
+        "<IMPORTANT>\n"
+        "Reminder:\n"
+        "- Function calls MUST follow the specified XML format.\n"
+        "- Required parameters MUST be specified.\n"
+        "- Action names must be plain enum values with no quotes, such as left_click or save_knowledge.\n"
+        f"- The current date is {datetime.today().strftime('%A, %B %d, %Y')}.\n"
+        f"- Collapsed screenshots appear as text: {collapse_text}\n"
+        "</IMPORTANT>\n\n"
+        "# Response format\n\n"
+        "For every turn output exactly:\n"
+        "1) Action: a short imperative describing the next step.\n"
+        "2) A single <tool_call>...</tool_call> block.\n\n"
+        "Rules:\n"
+        "- Take exactly one action per turn.\n"
+        "- Use GUI actions to browse.\n"
+        "- Use save_knowledge when the current screenshot or page visibly contains task-relevant knowledge worth preserving.\n"
+        "- save_knowledge must be grounded in visible evidence; do not save guesses.\n"
+        "- Use stop_search only after enough knowledge has been saved, or when evidence is insufficient and continued browsing is unlikely to help.\n"
+        "- Do not output anything after the tool call.\n"
+    )
+
+
+def parse_search_response(
+    response: str,
+    *,
+    coordinate_type: str,
+    original_width: int = None,
+    original_height: int = None,
+    processed_width: int = None,
+    processed_height: int = None,
+) -> Tuple[str, List[str]]:
+    low_level_instruction = ""
+    actions: List[str] = []
+
+    if not response or not response.strip():
+        return low_level_instruction, actions
+
+    def adjust(x: float, y: float) -> Tuple[int, int]:
+        return adjust_coordinates(
+            x,
+            y,
+            coordinate_type=coordinate_type,
+            original_width=original_width,
+            original_height=original_height,
+            processed_width=processed_width,
+            processed_height=processed_height,
+        )
+
+    def save_special(prefix: str, payload: Dict) -> None:
+        actions.append(prefix + json.dumps(payload, ensure_ascii=False))
+
+    for params in iter_tool_call_params(response):
+        action = _normalize_search_action(params.get("action"))
+        if not action:
+            continue
+
+        coordinate = parse_coordinate(params.get("coordinate"))
+        if action == "save_knowledge":
+            payload = {
+                "summary": str(params.get("summary") or ""),
+                "steps": params.get("steps") if isinstance(params.get("steps"), list) else params.get("steps", []),
+                "source": str(params.get("source") or ""),
+                "evidence": str(params.get("evidence") or ""),
+                "task_relevance": str(params.get("task_relevance") or ""),
+                "uncertainty": str(params.get("uncertainty") or ""),
+                "confidence": str(params.get("confidence") or "medium"),
+            }
+            save_special("SAVE_KNOWLEDGE:", payload)
+            continue
+        if action == "stop_search":
+            payload = {
+                "status": str(params.get("status") or "failure"),
+                "reason": str(params.get("reason") or ""),
+            }
+            save_special("STOP_SEARCH:", payload)
+            continue
+        if action == "left_click":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.click({x}, {y})")
+            else:
+                actions.append("pyautogui.click()")
+        elif action == "right_click":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.rightClick({x}, {y})")
+            else:
+                actions.append("pyautogui.rightClick()")
+        elif action == "middle_click":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.middleClick({x}, {y})")
+            else:
+                actions.append("pyautogui.middleClick()")
+        elif action == "double_click":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.doubleClick({x}, {y})")
+            else:
+                actions.append("pyautogui.doubleClick()")
+        elif action == "triple_click":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.tripleClick({x}, {y})")
+            else:
+                actions.append("pyautogui.tripleClick()")
+        elif action == "type":
+            text = "" if params.get("text") is None else str(params.get("text", ""))
+            actions.append(f"pyautogui.typewrite({py_string(text)})")
+        elif action == "key":
+            keys = parse_keys(params.get("keys", []), lowercase=True)
+            if keys:
+                keys_str = ", ".join(py_string(key) for key in keys)
+                if len(keys) > 1:
+                    actions.append(f"pyautogui.hotkey({keys_str})")
+                else:
+                    actions.append(f"pyautogui.press({keys_str})")
+        elif action == "key_down":
+            for key in parse_keys(params.get("keys", []), lowercase=True):
+                actions.append(f"pyautogui.keyDown({py_string(key)})")
+        elif action == "key_up":
+            for key in parse_keys(params.get("keys", []), lowercase=True):
+                actions.append(f"pyautogui.keyUp({py_string(key)})")
+        elif action in {"scroll", "hscroll"}:
+            pixels = int(parse_number(params.get("pixels", 0), default=0))
+            clicks = _pixels_to_clicks(pixels)
+            if action == "scroll":
+                clicks = -clicks
+            actions.append(f"pyautogui.{action}({clicks})")
+        elif action == "wait":
+            actions.append("WAIT")
+        elif action == "screenshot":
+            actions.append("WAIT")
+        elif action == "mouse_move":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.moveTo({x}, {y})")
+            else:
+                actions.append("pyautogui.moveTo(0, 0)")
+        elif action == "left_click_drag":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.dragTo({x}, {y}, duration=0.5)")
+            else:
+                actions.append("pyautogui.dragTo(0, 0)")
+        elif action == "left_mouse_down":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.moveTo({x}, {y})")
+            actions.append("pyautogui.mouseDown(button='left')")
+        elif action == "left_mouse_up":
+            if coordinate:
+                x, y = adjust(*coordinate)
+                actions.append(f"pyautogui.moveTo({x}, {y})")
+            actions.append("pyautogui.mouseUp(button='left')")
+
+    low_level_instruction = extract_action_line(response)
+    if not low_level_instruction and actions:
+        first = actions[0]
+        if first.startswith("SAVE_KNOWLEDGE:"):
+            low_level_instruction = "Save visible knowledge"
+        elif first.startswith("STOP_SEARCH:"):
+            low_level_instruction = "Stop search"
+        else:
+            low_level_instruction = "Perform action"
+    return low_level_instruction, actions
 
 
 class _GeminiBaseAgent:
@@ -59,6 +418,7 @@ class _GeminiBaseAgent:
         include_thoughts: bool = False,
         scaffold_profile: str = "qwen_internal",
         examples: list = None,
+        search_mode: bool = False,
     ):
         self.platform = platform
         self.model = model
@@ -81,6 +441,7 @@ class _GeminiBaseAgent:
         self.include_thoughts = include_thoughts
         self.scaffold_profile_name = scaffold_profile
         self.scaffold_profile = get_gemini_scaffold_profile(scaffold_profile)
+        self.search_mode = bool(search_mode)
         if isinstance(examples, dict):
             if "description" in examples:
                 self.examples = self._get_examples_video_description(examples)
@@ -164,7 +525,7 @@ class _GeminiBaseAgent:
     def _get_examples_traj(self, examples):
         newcontent = []
         if examples is not None:
-            with open(examples["init_screenshot"], 'rb') as f:
+            with open(examples["init_screenshot"], "rb") as f:
                 init_bytes = f.read()
             init_screenshot = process_image_resize(init_bytes, max_pixels=176400)
             img_url = f"data:image/png;base64,{init_screenshot}"
@@ -173,7 +534,7 @@ class _GeminiBaseAgent:
                 {"type": "image_url", "image_url": {"url": img_url}},
             ]
             for example in examples["steps"]:
-                with open(example["screenshot"], 'rb') as f:
+                with open(example["screenshot"], "rb") as f:
                     this_bytes = f.read()
                 this_screenshot = process_image_resize(this_bytes, max_pixels=176400)
                 img_url = f"data:image/png;base64,{this_screenshot}"
@@ -207,12 +568,12 @@ class _GeminiBaseAgent:
     def predict(self, instruction: str, obs: Dict) -> Tuple[str, List[str]]:
         screenshot_bytes = obs["screenshot"]
 
-        original_width, original_height = image_size_from_bytes(screenshot_bytes) # (1920,1080)
+        original_width, original_height = image_size_from_bytes(screenshot_bytes)
         processed_b64 = process_image(screenshot_bytes)
-        processed_width, processed_height = image_size_from_base64(processed_b64) # (1920,1080)
+        processed_width, processed_height = image_size_from_base64(processed_b64)
 
         self.screenshots.append(processed_b64)
-        total_steps = len(self.screenshots) # starts from 1
+        total_steps = len(self.screenshots)
         self.folded_prefix_k = update_folding_state(
             total_steps,
             self.folded_prefix_k,
@@ -229,7 +590,7 @@ class _GeminiBaseAgent:
             instruction_prompt = [
                 "\nPlease generate the next move according to the UI screenshot, instruction and previous actions.\n\nThe instruction is given in the following audio:\n",
                 instruction,
-                f"Previous actions:\n{previous_actions_str}"
+                f"Previous actions:\n{previous_actions_str}",
             ]
         else:
             instruction_prompt = build_instruction_prompt(instruction, previous_actions_str)
@@ -257,7 +618,7 @@ class _GeminiBaseAgent:
             logger.info("%s Output: %s", self._log_prefix(), response)
         self.responses.append(response or "")
 
-        low_level_instruction, pyautogui_code = self._parse_response(
+        low_level_instruction, parsed_actions = self._parse_response(
             response or "",
             original_width=original_width,
             original_height=original_height,
@@ -267,10 +628,10 @@ class _GeminiBaseAgent:
 
         if logger:
             logger.info("Low level instruction: %s", low_level_instruction)
-            logger.info("Pyautogui code: %s", pyautogui_code)
+            logger.info("Pyautogui code: %s", parsed_actions)
 
         self.actions.append(low_level_instruction)
-        return response or "", pyautogui_code
+        return response or "", parsed_actions
 
     def parse_response(
         self,
@@ -322,14 +683,18 @@ class GeminiAgent(_GeminiBaseAgent):
         self,
         *args,
         observation_type: str = "screenshot",
+        search_mode: bool = False,
         **kwargs,
     ):
-        super().__init__(*args, observation_type="screenshot", **kwargs)
+        super().__init__(*args, observation_type="screenshot", search_mode=search_mode, **kwargs)
         if observation_type != "screenshot":
             raise ValueError("GeminiAgent supports only screenshot observations")
         self.observation_type = observation_type
+        self.search_mode = bool(search_mode)
 
     def _build_tools_def(self, processed_width: int, processed_height: int) -> Dict:
+        if self.search_mode:
+            return build_search_tools_def(processed_width, processed_height, self.coordinate_type)
         return self.scaffold_profile.build_tools_def(
             processed_width,
             processed_height,
@@ -337,9 +702,13 @@ class GeminiAgent(_GeminiBaseAgent):
         )
 
     def _build_system_prompt(self, tools_def: Dict) -> str:
+        if self.search_mode:
+            return build_search_system_prompt(tools_def, self.collapse_text)
         return self.scaffold_profile.build_system_prompt(tools_def, self.collapse_text)
 
     def _response_transform(self, response: str) -> str:
+        if self.search_mode:
+            return ensure_empty_think_prefix(response)
         return self.scaffold_profile.response_transform(response)
 
     def _debug_message_filename(self, step_idx: int) -> str:
@@ -357,6 +726,15 @@ class GeminiAgent(_GeminiBaseAgent):
         processed_width: int,
         processed_height: int,
     ) -> Tuple[str, List[str]]:
+        if self.search_mode:
+            return parse_search_response(
+                response,
+                coordinate_type=self.coordinate_type,
+                original_width=original_width,
+                original_height=original_height,
+                processed_width=processed_width,
+                processed_height=processed_height,
+            )
         return self.scaffold_profile.parse_response(
             response,
             coordinate_type=self.coordinate_type,
@@ -374,6 +752,15 @@ class GeminiAgent(_GeminiBaseAgent):
         processed_width: int = None,
         processed_height: int = None,
     ) -> Tuple[str, List[str]]:
+        if self.search_mode:
+            return parse_search_response(
+                response,
+                coordinate_type=self.coordinate_type,
+                original_width=original_width,
+                original_height=original_height,
+                processed_width=processed_width,
+                processed_height=processed_height,
+            )
         return self.scaffold_profile.parse_response(
             response,
             coordinate_type=self.coordinate_type,

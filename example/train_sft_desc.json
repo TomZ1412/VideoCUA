@@ -1,0 +1,36 @@
+[
+  {
+    "conversations": [
+      {
+        "from": "human",
+        "value": "<video>\nYou are given the above video tutorial teaching you how to perform a computer use task. The task is described as follows:\nAccess webpage OneDrive, delete file Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3, and then restore it.\n\nThe starting point of the task is shown in the following screenshot:\n<image>\n\nUse ONLY the knowledge from the video, describe how to perform the task step by step starting from the current screenshot.\nThe video may not contain the entire task. It may only contain a part of the task. Just describe the part of the task that is shown in the video.\n\nFor example, for a long task where part of it requires you to login with username and password that is included in the video, you should output the following:\nWhen you want to log in, you should first click the login button on the left menu bar. Then, this will direct you to the login page. You need to enter your username and password. You should first click on the textbox with a word \"Username\" and then enter your username. Then, click on the textbox with a word \"Password\" and enter your password.\n\n### Rules\n1. Do not use your own knowledge. Just describe what you can learn from the video.\n2. Always output step by step, and at the end of each step, describe what screen status you are expected to get.\n3. Try to gather as much information/procedural knowledge as possible from the video. \n4. If the video contains the entire task, describe the entire task.\n5. If the video really does not contain anything meaningful, output \"I can not get useful knowledge from the video\".\n\nDirectly output your step-by-step description.\n"
+      },
+      {
+        "from": "gpt",
+        "value": "Based on the video tutorial, here is how you can delete the file \"Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3\" on OneDrive and then restore it:\n\nStep 1: Open your web browser and navigate to the OneDrive web page (onedrive.live.com).\nStep 2: Click on \"Sign in\" and enter your credentials to log into your Microsoft OneDrive account. You will then see the main interface with all your files listed under \"My files\".\nStep 3: Locate and select the file named \"Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3\" by hovering over it and checking the selection circle that appears on the file's icon.\nStep 4: Once selected, click on the \"Delete\" option located on the top toolbar menu. Alternatively, you can right-click on the file and choose \"Delete\" from the context menu. The file will then be deleted and moved to the Recycle bin.\nStep 5: To restore the deleted file, navigate to the left side menu and click on \"Recycle bin\". You will see a list of deleted items.\nStep 6: Locate \"Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3\" in the Recycle bin list, and select it by checking the circle next to its name.\nStep 7: Click on the \"Restore\" button on the top toolbar. The file will then be restored back to its original location in your OneDrive files."
+      }
+    ],
+    "video": "YOUR_VIDEO_ROOT_PATH/Z0ohi5PzlVg.mp4",
+    "images": [
+      "YOUR_IMAGE_ROOT_PATH/all_images/52b4e7b4-4d95-4ce0-a2ea-958f6e31a04c.png"
+    ],
+    "task_id": "20241025200230_d44816bc-5309-4a2a-95db-21ccfbde7a1f"
+  },
+  {
+    "conversations": [
+      {
+        "from": "human",
+        "value": "<video>\nYou are given the above video tutorial teaching you how to perform a computer use task. The task is described as follows:\nAccess webpage OneDrive, delete file Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3, and then restore it.\n\nThe starting point of the task is shown in the following screenshot:\n<image>\n\nUse ONLY the knowledge from the video, describe how to perform the task step by step starting from the current screenshot.\nThe video may not contain the entire task. It may only contain a part of the task. Just describe the part of the task that is shown in the video.\n\nFor example, for a long task where part of it requires you to login with username and password that is included in the video, you should output the following:\nWhen you want to log in, you should first click the login button on the left menu bar. Then, this will direct you to the login page. You need to enter your username and password. You should first click on the textbox with a word \"Username\" and then enter your username. Then, click on the textbox with a word \"Password\" and enter your password.\n\n### Rules\n1. Do not use your own knowledge. Just describe what you can learn from the video.\n2. Always output step by step, and at the end of each step, describe what screen status you are expected to get.\n3. Try to gather as much information/procedural knowledge as possible from the video. \n4. If the video contains the entire task, describe the entire task.\n5. If the video really does not contain anything meaningful, output \"I can not get useful knowledge from the video\".\n\nDirectly output your step-by-step description.\n"
+      },
+      {
+        "from": "gpt",
+        "value": "Based on the tutorial video, here is how you can perform the task step-by-step:\n\n1. Click the \"Home - OneDrive\" tab on your browser. You are expected to see the OneDrive main interface displaying your files under \"My files\".\n2. Find the file named \"Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3\" in the list. Hover over the file and click the circular checkbox on the left side of the file name to select it. You are expected to see a blue checkmark in the checkbox and a list of options (Share, Delete, Move to, etc.) appear at the top bar.\n3. Click the \"Delete\" button on the top menu bar. You are expected to see a confirmation dialog asking \"Are you sure you want to send these items to the recycle bin?\".\n4. Click the blue \"Delete\" button inside the confirmation dialog. You are expected to see a notification that the file has been deleted, and the file will no longer appear in \"My files\".\n5. To restore the file, look at the left sidebar menu and click on \"Recycle bin\". You are expected to be directed to the Recycle bin page showing all deleted items.\n6. Locate the file \"Thank You Letter-Stanley Chu and Annie Chow Scholarship copy 3\" in the Recycle bin. Click the circular checkbox on its left to select it. You are expected to see a blue checkmark next to it, and \"Delete\" and \"Restore\" buttons appear on the top bar.\n7. Click the \"Restore\" button from the top menu bar. You are expected to see the file disappear from the Recycle bin list, as it has been restored to its original folder."
+      }
+    ],
+    "video": "YOUR_VIDEO_ROOT_PATH/_sCy2Ia4nfM.mp4",
+    "images": [
+      "YOUR_IMAGE_ROOT_PATH/all_images/52b4e7b4-4d95-4ce0-a2ea-958f6e31a04c.png"
+    ],
+    "task_id": "20241025200230_d44816bc-5309-4a2a-95db-21ccfbde7a1f"
+  }
+]

@@ -12,6 +12,19 @@ from .parser import (
     parse_number,
 )
 
+SCROLL_PIXELS_PER_CLICK = 120.0
+SCROLL_MAX_CLICKS = 8
+
+
+def _pixels_to_clicks(pixels: int) -> int:
+    if pixels == 0:
+        return 0
+    magnitude = min(
+        SCROLL_MAX_CLICKS,
+        max(1, int(abs(pixels) / SCROLL_PIXELS_PER_CLICK + 0.5)),
+    )
+    return magnitude if pixels > 0 else -magnitude
+
 
 def py_string(text: str) -> str:
     return json.dumps("" if text is None else str(text), ensure_ascii=False)
@@ -171,14 +184,28 @@ def parse_base_response(
                 pyautogui_code.append(f"pyautogui.hotkey({keys_str})")
             else:
                 pyautogui_code.append(f"pyautogui.press({keys_str})")
+        # elif action in {"scroll", "hscroll"}:
+        #     press_modifier_keys()
+        #     pixels = params.get("pixels", 0)
+        #     try:
+        #         pixels = int(float(pixels))
+        #     except Exception:
+        #         pixels = 0
+        #     pyautogui_code.append(f"pyautogui.scroll({pixels})")
+        #     release_modifier_keys()
         elif action in {"scroll", "hscroll"}:
             press_modifier_keys()
             pixels = params.get("pixels", 0)
             try:
                 pixels = int(float(pixels))
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 pixels = 0
-            pyautogui_code.append(f"pyautogui.scroll({pixels})")
+
+            clicks = _pixels_to_clicks(pixels)
+            if action == "scroll":
+                clicks = -clicks
+
+            pyautogui_code.append(f"pyautogui.{action}({clicks})")
             release_modifier_keys()
         elif action == "wait":
             pyautogui_code.append("WAIT")
@@ -304,12 +331,18 @@ def parse_internal_response(
         elif action == "key_up":
             for key in parse_keys(params.get("keys", []), lowercase=True):
                 pyautogui_code.append(f"pyautogui.keyUp({py_string(key)})")
-        elif action == "scroll":
+        # elif action == "scroll":
+        #     pixels = int(parse_number(params.get("pixels", 0), default=0))
+        #     pyautogui_code.append(f"pyautogui.scroll({pixels})")
+        # elif action == "hscroll":
+        #     pixels = int(parse_number(params.get("pixels", 0), default=0))
+        #     pyautogui_code.append(f"pyautogui.hscroll({pixels})")
+        elif action in {"scroll", "hscroll"}:
             pixels = int(parse_number(params.get("pixels", 0), default=0))
-            pyautogui_code.append(f"pyautogui.scroll({pixels})")
-        elif action == "hscroll":
-            pixels = int(parse_number(params.get("pixels", 0), default=0))
-            pyautogui_code.append(f"pyautogui.hscroll({pixels})")
+            clicks = _pixels_to_clicks(pixels)
+            if action == "scroll":
+                clicks = -clicks
+            pyautogui_code.append(f"pyautogui.{action}({clicks})")
         elif action == "wait":
             pyautogui_code.append("WAIT")
         elif action == "terminate":

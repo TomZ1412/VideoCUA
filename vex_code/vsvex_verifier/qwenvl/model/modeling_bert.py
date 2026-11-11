@@ -42,13 +42,22 @@ from transformers.modeling_utils import (
 )
 from transformers.pytorch_utils import (
     apply_chunking_to_forward,
-    find_pruneable_heads_and_indices,
     prune_linear_layer,
 )
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
 
 logger = logging.get_logger(__name__)
+
+
+def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+    """Compatibility helper removed from transformers.pytorch_utils in 5.x."""
+    mask = torch.ones(n_heads, head_size)
+    heads = set(heads) - already_pruned_heads
+    for head in heads:
+        head -= sum(1 for pruned in already_pruned_heads if pruned < head)
+        mask[head] = 0
+    return heads, mask.view(-1).nonzero().view(-1).long()
 
 
 class BertEmbeddings(nn.Module):
@@ -660,6 +669,15 @@ class BertPreTrainedModel(PreTrainedModel):
     base_model_prefix = "bert"
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
+    def invert_attention_mask(self, encoder_attention_mask):
+        if encoder_attention_mask.ndim == 2:
+            encoder_attention_mask = encoder_attention_mask[:, None, None, :]
+        elif encoder_attention_mask.ndim == 3:
+            encoder_attention_mask = encoder_attention_mask[:, None, :, :]
+        else:
+            raise ValueError("Expected a 2D or 3D encoder attention mask")
+        return (1.0 - encoder_attention_mask.to(self.dtype)) * torch.finfo(self.dtype).min
+
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -732,7 +750,7 @@ class BertModel(BertPreTrainedModel):
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
-        self.init_weights()
+        self.post_init()
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
@@ -1014,7 +1032,7 @@ class BertLMHeadModel(BertPreTrainedModel):
         self.bert = BertModel(config, add_pooling_layer=False)
         self.cls = None
 
-        self.init_weights()
+        self.post_init()
 
     # def get_output_embeddings(self):
     #     return self.cls.predictions.decoder
@@ -1177,7 +1195,7 @@ class BertForMaskedLM(BertPreTrainedModel):
         self.bert = BertModel(config, add_pooling_layer=False)
         self.cls = BertOnlyMLMHead(config)
 
-        self.init_weights()
+        self.post_init()
 
     def get_output_embeddings(self):
         return self.cls.predictions.decoder

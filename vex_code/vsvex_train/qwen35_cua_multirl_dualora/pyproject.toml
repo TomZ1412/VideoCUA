@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwenvl-audio-vllm"
+version = "0.1.0"
+description = "Qwen3.5 audio-visual extension for vLLM"
+requires-python = ">=3.11"
+
+[project.entry-points."vllm.general_plugins"]
+qwenvl_audio = "qwenvl.vllm_audio:register"
+
+[tool.setuptools.packages.find]
+include = ["qwenvl*"]
+namespaces = true

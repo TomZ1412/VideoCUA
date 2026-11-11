@@ -1,0 +1,15 @@
+# Python >=3.11; use the same CUDA/PyTorch environment as the Qwen3.5 harness.
+# The migrated custom model uses Transformers 5.17 APIs.
+torch>=2.7
+transformers==5.17.0
+accelerate>=1.10
+peft>=0.18
+liger-kernel
+safetensors
+huggingface-hub
+Pillow
+numpy
+joblib
+decord
+torchcodec
+# Optional: bytedtos (remote TOS), cruise (HDFS), wandb, vllm (GRPO).

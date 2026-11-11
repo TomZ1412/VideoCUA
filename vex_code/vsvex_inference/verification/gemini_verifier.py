@@ -80,9 +80,9 @@ def gpt4_caption(videopath, task):
     # type: list
     # content: each input text as a element
     client = openai.AzureOpenAI(
-        azure_endpoint="AZURE_OPENAI_ENDPOINT",
-        api_version="API_VERSION",
-        api_key="API_KEY",
+        azure_endpoint="https://example.com/v1",
+        api_version="2024-03-01-preview",
+        api_key=__import__("os").environ.get("OPENAI_API_KEY", ""),
     )
     tmp_path = create_video_clip(videopath)
     base64_video = encode_video_base64(tmp_path)
@@ -108,8 +108,8 @@ def gpt4_caption(videopath, task):
     return pred_answer
 
 
-json_file = "INPUT_JSON_PATH"
-output_json = "OUTPUT_JSON_PATH"
+json_file = 'YOUR_VERIFIER_INPUT_PATH'
+output_json = __import__("os").environ.get("VEX_OUTPUT_JSON", 'YOUR_GEMINI_VERIFIER_OUTPUT_PATH')
 
 covered = set()
 covered_data = []

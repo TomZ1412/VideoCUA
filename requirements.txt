@@ -1,11 +1,10 @@
-# Core model and distributed training
 torch==2.8.0
 torchvision==0.23.0
-transformers==4.57.0
+transformers==5.20.1
 tokenizers==0.22.2
 accelerate==1.10.0
 deepspeed==0.19.7
-peft==0.17.1
+peft>=0.18.0
 safetensors==0.8.0
 liger_kernel==0.5.10
 triton==3.4.0
@@ -43,6 +42,3 @@ tqdm==4.66.5
 bitsandbytes
 moviepy
 wandb
-
-# OSWorld and CUA-Gym are installed separately from their upstream sources.
-# Internal packages are intentionally omitted.

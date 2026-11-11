@@ -1,52 +1,25 @@
-# macOS metadata
-.DS_Store
-__MACOSX/
-._*
-
-# Python
 __pycache__/
 *.py[cod]
-*.so
-.Python
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Environments and local configuration
 .env
-.env.*
-!.env.example
 .venv/
-venv/
-env/
-
-# Packaging and caches
-build/
-dist/
-*.egg-info/
-.cache/
-*.cache
-
-# Experiment artifacts
-results/
-output/
-dataset/
-checkpoints/
 wandb/
+output/
+outputs/
+results/
+cache/
 *.log
-
-# Model/data artifacts
-*.pt
-*.pth
-*.ckpt
 *.safetensors
 *.bin
+*.pt
+*.pth
+*.mp4
+*.webm
+*.wav
+*.zip
+example/media/
 
-# Verification intermediates
-temp_overlap/
-audio_*/
-videos_*/
-traj_data_*.json
-video_eval_data_*.json
+# Local curation/audit files: never publish
+/SOURCE_MANIFEST.json
+/COPYING_NOTES.md
+/*AUDIT*
+.DS_Store

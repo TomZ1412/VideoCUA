@@ -42,7 +42,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
-from qwenvl.model.configuration_qwen3_vl_moe import WhisperConfig
+from qwenvl.model.configuration_audio import AudioWhisperConfig as WhisperConfig
 from qwenvl.model.modeling_bert import BertLMHeadModel
 import torch.nn.functional as F
 
@@ -398,6 +398,10 @@ class WhisperEncoderLayer(GradientCheckpointingLayer):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
+        # FSDP2 can pass different strides for a singleton batch in the
+        # checkpointed forward and its recomputation. LayerNorm saves its input
+        # stride, so normalize the layout before the first saved operation.
+        hidden_states = hidden_states.contiguous()
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states, attn_weights = self.self_attn(
@@ -553,8 +557,8 @@ class WhisperPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
             module.bias.data.zero_()
-        elif isinstance(module, WhisperEncoder):
-            module.embed_positions.weight.copy_(sinusoids(*module.embed_positions.weight.shape))
+        # elif isinstance(module, WhisperEncoder):
+        #     module.embed_positions.weight.copy_(sinusoids(*module.embed_positions.weight.shape))
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """

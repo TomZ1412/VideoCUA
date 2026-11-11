@@ -140,6 +140,8 @@ def call_gemini(
         maxOutputTokens=payload.get("max_tokens", default_max_tokens),
         thinkingConfig=thinking_config,
         mediaResolution=media_resolution_value,
+        responseMimeType=payload.get("response_mime_type"),
+        responseJsonSchema=payload.get("response_json_schema"),
     )
 
     attempt = 0
