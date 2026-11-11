@@ -46,8 +46,10 @@ for collecting trajectories, Kokoro narration and ffmpeg rendering. Configure
 YOUR_XXX_PATH placeholders or the provided environment/CLI options.
 
 [vsvex_verifier/README.md](vsvex_verifier/README.md) documents run_verifier.sh:
-MODEL_PATH, MODEL_BASE and VERIFIER_DATA are required, LORA_CKPT is optional.
-Set NO_AUDIO=true when using native Qwen3.5 base on video inputs.
+MODEL_PATH and MODEL_BASE must point to the VS2 Qwen3.5 audio-visual base and
+matching processor. VERIFIER_DATA is required. Set LORA_CKPT to the matching VS2
+caption adapter, or No for a fully merged VS2 checkpoint. Audio remains enabled
+according to use_audio in the input; NO_AUDIO=true is only a silent-video ablation.
 
 Configure scorer/filter_tasks_video_ordered_grouped_fixed.py with
 VEX_VERIFIER_RESULT, VEX_BACKUP_RESULT, VEX_PADDING_RESULT, VEX_TESTFILE and

@@ -1,4 +1,4 @@
-"""Qwen3.5 Dense/MoE + optional audio loading, following the local CUA harness."""
+"""Load VS2 audio-visual checkpoints with a Qwen3.5 Dense/MoE backbone."""
 import json
 from pathlib import Path
 
@@ -59,17 +59,13 @@ def load_model(model_path, processor_path=None, device='cuda', dtype='bfloat16',
     if raw.model_type not in ('qwen3_5', 'qwen3_5_moe'):
         raise ValueError(f'Expected a Qwen3.5 checkpoint, got {raw.model_type}')
     has_audio = bool(getattr(raw, 'audio_config', None))
-    if has_audio:
-        from qwenvl.model.configuration_audio import Qwen3_5AudioConfig, Qwen3_5MoeAudioConfig
-        from qwenvl.model.modeling_qwen3_5_audio import model_class_for_config
-        config_cls = Qwen3_5MoeAudioConfig if raw.model_type == 'qwen3_5_moe' else Qwen3_5AudioConfig
-        config = config_cls.from_pretrained(model_path)
-        model_cls = model_class_for_config(config)
-    else:
-        from transformers import Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration
-        config = raw
-        model_cls = (Qwen3_5MoeForConditionalGeneration if raw.model_type == 'qwen3_5_moe'
-                     else Qwen3_5ForConditionalGeneration)
+    if not has_audio:
+        raise ValueError('Verifier requires a VS2 Qwen3.5 audio-visual checkpoint, not native Qwen3.5')
+    from qwenvl.model.configuration_audio import Qwen3_5AudioConfig, Qwen3_5MoeAudioConfig
+    from qwenvl.model.modeling_qwen3_5_audio import model_class_for_config
+    config_cls = Qwen3_5MoeAudioConfig if raw.model_type == 'qwen3_5_moe' else Qwen3_5AudioConfig
+    config = config_cls.from_pretrained(model_path)
+    model_cls = model_class_for_config(config)
     processor = AutoProcessor.from_pretrained(processor_path or model_path)
     if has_audio and processor.tokenizer.convert_tokens_to_ids('<|audio_pad|>') != config.audio_token_id:
         raise ValueError('Processor audio token does not match model config')

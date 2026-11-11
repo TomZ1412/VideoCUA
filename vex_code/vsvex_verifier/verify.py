@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen3.5 probability-weighted verifier; supports legacy AV and CUA trajectories."""
+"""VS2 (Qwen3.5 backbone) probability-weighted audio-visual verifier."""
 import argparse
 import copy
 import json
@@ -125,7 +125,7 @@ def boolean(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', required=True)
+    parser.add_argument('--model', required=True, help='Full VS2 Qwen3.5 audio-visual checkpoint')
     parser.add_argument('--model_base', '--processor', dest='processor')
     parser.add_argument('--dataset', '--input', required=True, type=Path)
     parser.add_argument('--output', type=Path, help='JSON array compatible with original test_results.json')

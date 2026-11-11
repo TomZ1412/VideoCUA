@@ -74,7 +74,7 @@ VideoCUA/
     │   └── qwen35_cua_multirl_dualora/
     ├── vsvex_inference/             # Guidance, agents and benchmark runners
     │   └── verification/           # Narration and execution-video tools
-    └── vsvex_verifier/              # Qwen3.5 probability verifier
+    └── vsvex_verifier/              # VS2 verifier (Qwen3.5 backbone)
 ```
 
 See [`vex_code/README.md`](vex_code/README.md) for the execution order and configuration. No weights, full training annotations, benchmark results, logs or media datasets are included.
@@ -140,10 +140,11 @@ See [`vsvex_train/README.md`](vex_code/vsvex_train/README.md) for stage-specific
 4. Collect trajectories and render narrated videos using [`verification/`](vex_code/vsvex_inference/verification/).
 5. Score with [`run_verifier.sh`](vex_code/vsvex_verifier/run_verifier.sh), then select trials using [`scorer/`](vex_code/scorer/).
 
-The Qwen3.5 verifier can use base weights directly, or an explicitly configured compatible adapter. Native Qwen3.5 base requires silent video input; audio requires an audio-enabled Qwen3.5 checkpoint. Verification and trial selection operate offline over generated rollouts.
+The verifier uses **VS2 with a Qwen3.5 backbone**, including its Whisper/audio projection components. Load the audio-aligned VS2 base with its compatible caption adapter, or a fully merged VS2 checkpoint. Native Qwen3.5 weights are not used for this verifier. Verification and trial selection operate offline over generated rollouts.
 
 <a id="license"></a>
 
 ## 📄 License
 
 [Apache License 2.0](LICENSE). Existing upstream copyright and license notices are retained.
+
