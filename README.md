@@ -1,22 +1,36 @@
-# Video-as-Experience: Learning Computer Use via Audio-Visual Understanding
+<div align="center">
+
+# 🎬 Video-as-Experience
+
+### Learning Computer Use via Audio-Visual Understanding
+
+**🎥 Watch · 🖱️ Act · 🔍 Rewatch**
+
+</div>
 
 **VEX** unifies learning from tutorial videos and reflecting on an agent's own execution through a **watch–act–rewatch** framework.
 
-[Overview](#overview) · [Results](#results) · [Code](#code) · [Data](#data-and-examples) · [Training](#training) · [Evaluation](#evaluation-and-verification)
+[🧭 Overview](#overview) · [📊 Results](#results) · [📦 Release](#release) · [🗂️ Code](#code) · [📚 Data](#data-and-examples) · [🚀 Training](#training) · [🧪 Evaluation](#evaluation-and-verification)
 
 > This branch contains the Qwen3.5 implementation. The previous Qwen3-VL release is preserved on [`vex_qwen3vl`](https://github.com/TomZ1412/VideoCUA/tree/vex_qwen3vl).
 
-## Abstract
+<a id="abstract"></a>
 
-Multimodal large language models (LLMs) have enabled capable computer-use agents that perceive graphical user interfaces, reason over instructions, and execute actions. However, existing approaches to learning from video demonstrations typically convert videos into screenshotbased action trajectories, rather than directly leveraging their rich audio-visual information. We introduce VEX (Video as EXperience), a framework that uses audio-visual understanding to unify learning from external demonstrations and reflecting on an agent’s own behavior. Following a watch-act-rewatch paradigm, the agent extracts procedural guidance from tutorial videos containing visual demonstrations and spoken explanations, executes tasks, and verifies its progress by rewatching its execution as video. We instantiate VEX with video-SALMONN-VEX, a 9Bscale audio-visual computer-use agent built on the video- SALMONN 2 architecture with a Qwen3.5-9B backbone. We further introduce Action-Grounded Guide Optimization (AGGO), a reinforcement learning method that optimizes video-derived guidance for downstream action prediction, and augment AgentNet, OSWorld, and CUA-Gym with over 24K real-world tutorial videos. Experiments on OSWorld and a complementary subset of CUA-Gym demonstrate consistent improvements, with video-SALMONN-VEX achieving a 22% relative increase in task success over its Qwen3.5 backbone on OSWorld. Moreover, its generated guidance improves Gemini-3.5-flash by 10% relatively on OSWorld. These results highlight the potential of audio-visual understanding as a unified interface for procedural learning and self-verification in computer-use agents.
+## 📝 Abstract
 
-## Overview
+Multimodal large language models (LLMs) have enabled capable computer-use agents that perceive graphical user interfaces, reason over instructions, and execute actions. However, existing approaches to learning from video demonstrations typically convert videos into screenshot-based action trajectories, rather than directly leveraging their rich audio-visual information. We introduce VEX (Video as EXperience), a framework that uses audio-visual understanding to unify learning from external demonstrations and reflecting on an agent’s own behavior. Following a watch-act-rewatch paradigm, the agent extracts procedural guidance from tutorial videos containing visual demonstrations and spoken explanations, executes tasks, and verifies its progress by rewatching its execution as video. We instantiate VEX with video-SALMONN-VEX, a 9B-scale audio-visual computer-use agent built on the video-SALMONN 2 architecture with a Qwen3.5-9B backbone. We further introduce Action-Grounded Guide Optimization (AGGO), a reinforcement learning method that optimizes video-derived guidance for downstream action prediction, and augment AgentNet, OSWorld, and CUA-Gym with over 24K real-world tutorial videos. Experiments on OSWorld and a complementary subset of CUA-Gym demonstrate consistent improvements, with video-SALMONN-VEX achieving a 22% relative increase in task success over its Qwen3.5 backbone on OSWorld. Moreover, its generated guidance improves Gemini-3.5-flash by 10% relatively on OSWorld. These results highlight the potential of audio-visual understanding as a unified interface for procedural learning and self-verification in computer-use agents.
+
+<a id="overview"></a>
+
+## 🧭 Overview
 
 ![VEX framework: watch, act, and rewatch](assets/vex_framework.png)
 
 VEX extracts task-relevant procedural guidance from tutorial videos, executes computer-use tasks, and verifies progress from narrated execution videos. **Action-Grounded Guide Optimization (AGGO)** trains separate guidance and action LoRA adapters using downstream action-likelihood rewards. At inference time, verification supports stopping and selecting among repeated attempts.
 
-## Results
+<a id="results"></a>
+
+## 📊 Results
 
 Task success rate (%) from Tables 2–3 of the paper:
 
@@ -40,7 +54,9 @@ Guidance transfer to Gemini-3.5-flash (Table 7):
 
 These are the paper's reported results, not new measurements from this code release.
 
-## Release
+<a id="release"></a>
+
+## 📦 Release
 
 - [x] Qwen3.5 audio-visual model and dual-LoRA AGGO code
 - [x] Action-SFT, description-SFT, AGGO and verifier launchers
@@ -49,7 +65,9 @@ These are the paper's reported results, not new measurements from this code rele
 - [x] Task-to-video-ID metadata and real-source format examples
 - [ ] Model checkpoints — **will be published later**
 
-## Code
+<a id="code"></a>
+
+## 🗂️ Code
 
 ```text
 VideoCUA/
@@ -69,7 +87,9 @@ VideoCUA/
 
 See [`vex_code/README.md`](vex_code/README.md) for the execution order and configuration. No weights, full training annotations, benchmark results, logs or media datasets are included.
 
-## Installation
+<a id="installation"></a>
+
+## 🛠️ Installation
 
 Use Linux with NVIDIA GPUs and Python 3.11+. Install a CUDA-compatible PyTorch stack, then the dependencies:
 
@@ -81,7 +101,9 @@ python -m pip install -e . --no-deps --no-build-isolation
 
 The custom Qwen3.5 implementation needs compatible Transformers, TorchCodec and model dependencies. Guidance decoding additionally uses vLLM; narration uses Kokoro and system `ffmpeg`/`ffprobe`. Install OSWorld and CUA-Gym independently and configure their task bundles and VM/provider environments. See the component READMEs for details.
 
-## Data and examples
+<a id="data-and-examples"></a>
+
+## 📚 Data and examples
 
 The metadata contains video identifiers, **not local paths or generated descriptions**:
 
@@ -93,7 +115,9 @@ See [`metadata/README.md`](metadata/README.md) for the format and counts. Media 
 
 [`example/`](example/) contains one or two records extracted from real experiment files for action SFT, description SFT, AGGO, task configurations, guidance extraction, descriptions and verification. Only machine-specific media paths are replaced with placeholders. The examples illustrate data formats, not full datasets; verification.json shows actual verifier outputs.
 
-## Training
+<a id="training"></a>
+
+## 🚀 Training
 
 Configure paths through environment variables and use the provided launchers:
 
@@ -114,7 +138,9 @@ bash vex_code/vsvex_train/aggo.sh
 
 See [`vsvex_train/README.md`](vex_code/vsvex_train/README.md) for stage-specific inputs and defaults. The audio-aligned base, initialization adapter, SFT checkpoints and final AGGO weights **will be published later**.
 
-## Evaluation and verification
+<a id="evaluation-and-verification"></a>
+
+## 🧪 Evaluation and verification
 
 1. Extract tutorial guidance with the existing training `test.sh`, selecting `adapter_2`.
 2. Convert decoding outputs with [`get_video_desc.py`](vex_code/vsvex_inference/guidance/get_video_desc.py).
@@ -124,6 +150,8 @@ See [`vsvex_train/README.md`](vex_code/vsvex_train/README.md) for stage-specific
 
 The Qwen3.5 verifier can use base weights directly, or an explicitly configured compatible adapter. Native Qwen3.5 base requires silent video input; audio requires an audio-enabled Qwen3.5 checkpoint. Verification and trial selection operate offline over generated rollouts.
 
-## License
+<a id="license"></a>
+
+## 📄 License
 
 [Apache License 2.0](LICENSE). Existing upstream copyright and license notices are retained.
