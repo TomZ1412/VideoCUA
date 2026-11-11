@@ -1,12 +1,4 @@
-<div align="center">
-
-# 🎬 Video-as-Experience
-
-### Learning Computer Use via Audio-Visual Understanding
-
-**🎥 Watch · 🖱️ Act · 🔍 Rewatch**
-
-</div>
+# Video-as-Experience: Learning Computer Use via Audio-Visual Understanding
 
 **VEX** unifies learning from tutorial videos and reflecting on an agent's own execution through a **watch–act–rewatch** framework.
 
