@@ -4,8 +4,6 @@
 
 [🧭 Overview](#overview) · [📊 Results](#results) · [📦 Release](#release) · [🗂️ Code](#code) · [📚 Data](#data-and-examples) · [🚀 Training](#training) · [🧪 Evaluation](#evaluation-and-verification)
 
-> This branch contains the Qwen3.5 implementation. The previous Qwen3-VL release is preserved on [`vex_qwen3vl`](https://github.com/TomZ1412/VideoCUA/tree/vex_qwen3vl).
-
 <a id="abstract"></a>
 
 ## 📝 Abstract
